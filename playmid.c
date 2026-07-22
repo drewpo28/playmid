@@ -17,22 +17,46 @@
  */
 
 /*
-Compilar con:
+Compilar con (SDCC 3.x):
 sdcc -mz80 --reserve-regs-iy --opt-code-size --max-allocs-per-node 10000 ^
---nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2b00 playmid.c z80.lib -L "C:\Program Files\SDCC\lib\z80"
+--nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2d00 playmid.c z80.lib -L "C:\Program Files\SDCC\lib\z80"
 makebin -s 65535 -p playmid.ihx playmid.bin
 dd if=playmid.bin of=PLAYMID bs=1 skip=8192
 
-OJO con --data-loc. Ahora mismo hay un margen de unos 180 bytes entre el final del códdigo (sin librerías) y el valor
-que se indica en --data-loc. Si el código de este programa crece, habría que mover --data-loc adecuadamente para que no se
-solapen. Ojala encuentre una forma de evitar esto y que los datos, sencillamente, se pongan al final de todo el código, o
-entre mi código y las librerías, sin tener que especificar nada.
+Con SDCC 4.2 o superior, compilar con la convencion de llamada por defecto (NO usar --sdcccall 0:
+z80.lib viene compilada con la convencion por registros y las rutinas de multiplicacion/division
+recibirian basura; las funciones con ensamblador incrustado ya van marcadas con __sdcccall(0)):
+sdcc -mz80 --reserve-regs-iy --opt-code-size --max-allocs-per-node 10000 \
+--nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2d00 playmid.c z80.lib -L /path/to/sdcc/lib/z80
+
+OJO con --data-loc. Si el código de este programa crece, habría que mover --data-loc adecuadamente para que no se
+solapen codigo y datos. Comprobar en el .map que _CODE+codigo de librerias termina antes de --data-loc, y que
+DATA termina antes de 0x3000 (donde empieza el buffer).
+
+MAPA DE MEMORIA (DivMMC RAM, 0x2000-0x3FFF):
+  0x2000-0x2CFF : codigo + literales
+  0x2D00-0x2FFF : datos (variables globales, estado de pistas)
+  0x3000-0x33FF : buffer de 1KB: 64 bytes de staging de salida + 960 bytes de cachés
+                  de lectura repartidos entre las pistas
+  0x3400-0x3FFF : NO TOCAR. Lanzadores de comandos como el LNF Browser guardan aqui su
+                  propio estado; escribir en esta zona cuelga o resetea al volver.
 
 */
 
 typedef unsigned char BYTE;
 typedef unsigned short WORD;
 typedef unsigned long DWORD;
+
+// Las funciones con ensamblador incrustado leen sus parametros de la pila (4(ix), etc),
+// es decir, usan la convencion de llamada clasica de SDCC 3.x. En SDCC 4.2+ la convencion
+// por defecto es por registros, y OJO: z80.lib viene compilada con ella, asi que hay que
+// compilar SIN --sdcccall 0 (o las rutinas de multiplicacion/division de 32 bits reciben
+// basura) y marcar solo estas funciones como __sdcccall(0).
+#if defined(__SDCC_VERSION_MAJOR) && (__SDCC_VERSION_MAJOR >= 4)
+#define STACKARGS __sdcccall(0)
+#else
+#define STACKARGS
+#endif
 
 __sfr __at (0xfe) ULA;
 __sfr __at (0xff) ATTR;
@@ -99,31 +123,42 @@ BYTE errno;
 // variables globales en lugar de locales para agilizar su lectura, y no depender de direccionamiento indexado
 // que engordaría y enlentecería (más aún) el programa
 
-BYTE formato;  // formato del fichero MIDI: 0, 1 o 2. En realidad esta variable es un poco superflua.
+BYTE formato;  // formato del fichero MIDI: 0, 1 o 2.
 BYTE i, c;     // contadores de bucle, etc.
-BYTE status;   // byte de estado del evento MIDI
-BYTE param1, param2;  // bytes de parametros opcionales para el estado
-BYTE running_status;  // a 1 si el evento actual no tiene estado.
-DWORD ppq, delta, delta_ints, ticks_per_int, tick;  // variables que se usan para calcular el tempo de la melodía
-__at(0x3000) BYTE buffer[1024];  // Buffer de 1KB para guardar eventos MIDI. No moverlo de aqui sin tocar SendMIDI
-WORD pos, ppos, leido, lbytes;   // variables para movernos por el buffer. ppos se usa para saber si hemos pasado de una mitad a otra del buffer
+BYTE param1;   // tipo de metaevento
+DWORD ppq, ticks_per_int;  // variables que se usan para calcular el tempo de la melodía
+__at(0x3000) BYTE buffer[1024];  // Staging para la cabecera y los eventos MIDI salientes. No moverlo de aqui sin tocar SendMIDI
+WORD lbytes;             // longitud de metaeventos y sysex
 DWORD us_per_quarter;    // ultimo tempo leido con el metaevento Set Tempo
 
-BYTE main (char *p);
+// ---- Soporte para MIDI formato 1 (multipista) ----
+// Todo vive DENTRO del buffer de 1KB en 0x3000: los primeros 64 bytes son el staging de
+// salida (y scratch para cabeceras), y los 960 restantes se reparten como cachés de
+// lectura entre las pistas. OJO: no usar memoria por encima de 0x33FF; lanzadores como
+// el LNF Browser guardan su propio estado/pila en la parte alta de la página DivMMC y
+// escribir ahí cuelga o resetea la maquina al volver.
+#define MAX_TRACKS   24                   // numero maximo de pistas que podemos mezclar (los format 1 tipicos traen 1+16)
+#define TCACHE_TOTAL (1024-64)            // bytes de buffer disponibles para cachés de pista
+#define tcaches      (buffer+64)          // las cachés empiezan tras el staging
+
+BYTE fhandle;                    // handle del fichero, global para poder recargar cachés desde cualquier rutina
+
+BYTE main (char *p) STACKARGS;
 void usage (void);
 BYTE commandlinemode (char *p);
 
 void __sdcc_enter_ix (void) __naked;
 
-void puts (BYTE *);
+void puts (BYTE *) STACKARGS;
 void u16tohex (WORD n, char *s);
 void u8tohex (BYTE n, char *s);
 void print8bhex (BYTE n);
 void print16bhex (WORD n);
 
-BYTE open (char *filename, BYTE mode);
-void close (BYTE handle);
-WORD read (BYTE handle, BYTE *buffer, WORD nbytes);
+BYTE open (char *filename, BYTE mode) STACKARGS;
+void close (BYTE handle) STACKARGS;
+WORD read (BYTE handle, BYTE *buffer, WORD nbytes) STACKARGS;
+void seekset (BYTE handle, DWORD offset) STACKARGS;
 
 /* --------------------------------------------------------------------------------- */
 /* --------------------------------------------------------------------------------- */
@@ -131,7 +166,7 @@ WORD read (BYTE handle, BYTE *buffer, WORD nbytes);
 void getfilename (char *p, char *fname);
 void playmidi (BYTE f);
 int cmp4b (BYTE *a, BYTE *b);
-void SendMIDI (BYTE *ev, BYTE lev);
+void SendMIDI (BYTE *ev, BYTE lev) STACKARGS;
 void SendMIDIByte (void) __naked;
 
 // Rutina inicial. Debe ser el primer código que se encuentre en el fichero. Esta inicialización
@@ -155,9 +190,15 @@ void init (void) __naked
 }
 
 // Programa principal. Toma como argumento un puntero al comienzo de la linea de comandos. Si es NULL, no hay linea de comandos
-BYTE main (char *p)
+BYTE main (char *p) STACKARGS
 {
   BYTE res, comando;
+
+  // Algunos lanzadores (p.ej. el LNF Browser) pueden pasarnos el control con las
+  // interrupciones deshabilitadas, y el primer HALT colgaria la maquina para siempre.
+  __asm
+  ei
+  __endasm;
 
   // Dejamos el puerto MIDI inactivo
   AYREGSELECT = 0x0e;
@@ -207,17 +248,265 @@ void usage (void)
 {
         // 01234567890123456789012345678901
     puts (" PLAYMID file.mid\xd\xd"
-          "Plays a MIDI format 0 file thru\xd"
-          "MIDI OUT connector.\xd");
+          "Plays a MIDI format 0 or 1 file\xd"
+          "thru MIDI OUT connector.\xd");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Rutina principal de reproducción MIDI
+/* ============================ FORMAT1 ENGINE BEGIN ============================
+   Motor de reproducción: mezcla N pistas "al vuelo" (formato 1). El formato 0
+   es el caso trivial de una sola pista y se reproduce con el mismo motor.
+   Cada pista mantiene su propio offset dentro del fichero, su running status,
+   el tick absoluto de su siguiente evento, y una caché de lectura propia.
+   El bucle principal elige siempre la pista cuyo siguiente evento es el más
+   cercano en el tiempo (merge por tick mínimo), espera hasta ese tick, y
+   procesa el evento recargando la caché con F_SEEK + F_READ si hace falta.
+   Los eventos de tempo (FF 51) se aplican globalmente, lo que con el merge
+   por ticks da el resultado correcto sin más esfuerzo. */
+
+BYTE tracks;                   // numero de pistas MTrk encontradas (max MAX_TRACKS)
+BYTE curtrk;                   // pista que se está procesando ahora mismo
+BYTE *cptr;                    // puntero a la caché de curtrk
+WORD tcsize;                   // tamaño de la caché de cada pista (TCACHE_TOTAL/tracks)
+DWORD trk_off[MAX_TRACKS];     // offset en el fichero de la proxima recarga de caché
+DWORD trk_next[MAX_TRACKS];    // tick absoluto (escalado por PRECISION) del proximo evento
+BYTE trk_status[MAX_TRACKS];   // running status propio de cada pista (imprescindible al mezclar)
+BYTE trk_end[MAX_TRACKS];      // a 1 cuando la pista ha terminado (FF 2F o EOF)
+WORD trk_cpos[MAX_TRACKS];     // posicion de lectura dentro de la caché
+WORD trk_clen[MAX_TRACKS];     // bytes válidos en la caché
+DWORD now;                     // ticks transcurridos desde el principio (escalado por PRECISION)
+
+// Selecciona la pista activa y apunta cptr a su caché
+void set_curtrk (BYTE t)
+{
+    curtrk = t;
+    cptr = tcaches + (WORD)t * tcsize;
+}
+
+// Recarga la caché de la pista activa desde su offset en el fichero.
+// Si no quedan bytes (EOF o error), da la pista por terminada.
+void trk_refill (void)
+{
+    WORD n;
+
+    seekset (fhandle, trk_off[curtrk]);
+    n = read (fhandle, cptr, tcsize);
+    if (n == 0 || n == 0xFFFF)
+    {
+        trk_end[curtrk] = 1;
+        trk_clen[curtrk] = 0;
+    }
+    else
+    {
+        trk_off[curtrk] += n;
+        trk_clen[curtrk] = n;
+    }
+    trk_cpos[curtrk] = 0;
+}
+
+// Lee el siguiente byte de la pista activa, sin consumirlo
+BYTE trk_peek (void)
+{
+    if (trk_cpos[curtrk] >= trk_clen[curtrk])
+    {
+        trk_refill();
+        if (trk_end[curtrk])
+            return 0;
+    }
+    return cptr[trk_cpos[curtrk]];
+}
+
+// Lee y consume el siguiente byte de la pista activa
+BYTE trk_get (void)
+{
+    if (trk_cpos[curtrk] >= trk_clen[curtrk])
+    {
+        trk_refill();
+        if (trk_end[curtrk])
+            return 0;
+    }
+    return cptr[trk_cpos[curtrk]++];
+}
+
+// Lee una cantidad de longitud variable (delta o longitud de metaevento/sysex)
+DWORD trk_varlen (void)
+{
+    DWORD v = 0;
+
+    do
+    {
+        c = trk_get();
+        v = (v<<7) | (c & 0x7F);
+    }
+    while (c & 0x80);
+    return v;
+}
+
+// Procesa un evento de la pista activa (el delta ya se consumió antes).
+// A diferencia del reproductor de formato 0, aqui SIEMPRE se envia el byte de
+// estado: el running status de la linea MIDI se rompe al intercalar pistas.
+void trk_event (void)
+{
+    BYTE st, n;
+
+    c = trk_peek();
+    if (c & 0x80)          // byte de estado nuevo: lo consumimos y actualizamos el running status de ESTA pista
+    {
+        trk_status[curtrk] = c;
+        trk_get();
+    }
+    st = trk_status[curtrk];
+
+    // EVENTOS F0 y F7 (SYSEX). Se envian por trozos usando el buffer como staging
+    if (st == 0xF0 || st == 0xF7)
+    {
+        lbytes = trk_varlen();
+        if (st == 0xF0)
+        {
+            buffer[0] = 0xF0;
+            SendMIDI (buffer, 1);
+        }
+        while (lbytes)
+        {
+            n = (lbytes > 64) ? 64 : lbytes;   // el staging son los primeros 64 bytes del buffer
+            for (i=0;i<n;i++)
+                buffer[i] = trk_get();
+            SendMIDI (buffer, n);
+            lbytes -= n;
+        }
+        return;
+    }
+
+    // METAEVENTOS FF. Todos tienen la forma FF tipo longitud datos, asi que se
+    // pueden saltar de forma generica. Solo tempo y fin de pista nos interesan.
+    if (st == 0xFF)
+    {
+        param1 = trk_get();
+        lbytes = trk_varlen();
+        if (param1 == 0x2F)          // fin de pista
+        {
+            trk_end[curtrk] = 1;
+            return;
+        }
+        if (param1 == 0x51 && lbytes == 3)   // Set Tempo: se aplica globalmente
+        {
+            us_per_quarter = 0;
+            for (i=0;i<3;i++)
+                us_per_quarter = (us_per_quarter<<8) | trk_get();
+            if (us_per_quarter)
+                ticks_per_int = PRECISION * 20000L * ppq / us_per_quarter;
+            return;
+        }
+        while (lbytes--)             // el resto de metaeventos se ignora
+            trk_get();
+        return;
+    }
+
+    // EVENTOS de canal: estado + 1 o 2 bytes de datos, via staging
+    buffer[0] = st;
+    buffer[1] = trk_get();
+    c = st & 0xF0;
+    if (c == 0xC0 || c == 0xD0)
+        n = 2;
+    else
+    {
+        buffer[2] = trk_get();
+        n = 3;
+    }
+    SendMIDI (buffer, n);
+}
+
+// Bucle principal de reproduccion de formato 1.
+// ntrk es el numero de pistas que declara la cabecera MThd.
+void playmidi1 (BYTE ntrk)
+{
+    BYTE best;
+    DWORD len, fpos;
+
+    // Recorremos los chunks del fichero construyendo la tabla de offsets de
+    // comienzo de cada pista. La longitud de cada chunk está en su cabecera.
+    tracks = 0;
+    fpos = 14;
+    while (tracks < ntrk && tracks < MAX_TRACKS)
+    {
+        seekset (fhandle, fpos);
+        if (read (fhandle, buffer, 8) != 8)
+            break;
+        len = ((DWORD)buffer[4]<<24) | ((DWORD)buffer[5]<<16) | ((DWORD)buffer[6]<<8) | buffer[7];
+        fpos += 8;
+        if (cmp4b (buffer, "MTrk"))
+        {
+            trk_off[tracks] = fpos;
+            trk_status[tracks] = 0;
+            trk_end[tracks] = 0;
+            trk_cpos[tracks] = 0;
+            trk_clen[tracks] = 0;
+            tracks++;
+        }
+        fpos += len;    // chunks desconocidos se saltan sin contarlos
+    }
+    if (tracks == 0)
+    {
+        puts ("MTrk chunk expected\xd");
+        return;
+    }
+
+    // Cuantas menos pistas, mas caché por pista y menos seeks durante la reproduccion
+    tcsize = TCACHE_TOTAL / tracks;
+
+    // Leemos el primer delta de cada pista para inicializar su next_tick
+    for (best = 0; best < tracks; best++)
+    {
+        set_curtrk (best);
+        trk_next[best] = trk_varlen() * PRECISION;
+    }
+
+    now = 0;
+    while (1)
+    {
+        // Si pulsamos SPACE, salir
+        if ((SEMIFILA8 & 0x1) == 0)
+            return;
+
+        // Elegimos la pista viva cuyo proximo evento tiene el tick minimo
+        best = 0xFF;
+        for (i = 0; i < tracks; i++)
+        {
+            if (trk_end[i])
+                continue;
+            if (best == 0xFF || trk_next[i] < trk_next[best])
+                best = i;
+        }
+        if (best == 0xFF)      // todas las pistas han terminado
+            return;
+
+        // Esperamos hasta que el reloj global alcance el tick del evento
+        while (now < trk_next[best])
+        {
+            if ((SEMIFILA8 & 0x1) == 0)
+                return;
+            WAIT_VRETRACE;
+            now += ticks_per_int;
+        }
+
+        // Procesamos el evento y programamos el siguiente de esta pista
+        set_curtrk (best);
+        trk_event ();
+        if (!trk_end[best])
+            trk_next[best] += trk_varlen() * PRECISION;
+    }
+}
+
+/* ============================ FORMAT1 ENGINE END ============================ */
+
+// Rutina principal de reproducción MIDI. Analiza la cabecera y lanza el motor
+// de mezcla, que reproduce tanto formato 1 como formato 0 (caso trivial de una
+// sola pista, con toda la caché para ella, asi que las lecturas son secuenciales).
 void playmidi (BYTE f)
 {
-    // Leemos los primeros 512 bytes del fichero, en donde se encuentra la cabecera MIDI (14 bytes)
-    read (f, buffer, 512);
+    // Leemos la cabecera MIDI (14 bytes)
+    read (f, buffer, 14);
 
     // Comprobamos que realmente es una cabecera MIDI, y si no, retornamos con error
     if (cmp4b (buffer, "MThd") == 0)
@@ -226,11 +515,11 @@ void playmidi (BYTE f)
         return;
     }
 
-    // Leemos el formato del fichero. Sólo aceptamos formato 0
+    // Leemos el formato del fichero. Aceptamos formatos 0 y 1
     formato = buffer[9];
-    if (formato != 0)
+    if (formato > 1)
     {
-        puts ("Only format 0 MIDI files. Sorry\xd");
+        puts ("Only format 0 or 1 MIDI files. Sorry\xd");
         return;
     }
 
@@ -255,196 +544,8 @@ void playmidi (BYTE f)
         ticks_per_int = PRECISION * 20 * ppq / 500;
     }
 
-    // Comprobamos que realmente es una pista MIDI, y si no es así, retornamos con error.
-    if (cmp4b (buffer+14, "MTrk") == 0)
-    {
-        puts ("MTrk chunk expected\xd");
-        return;
-    }
-
-    // A partir de aquí, lo que hay en el MIDI son eventos.
-    pos = 22;   // nos situamos al comienzo del primer evento de la pista
-    ppos = 512; // forzamos a que se vaya leyendo la segunda mitad del buffer
-    tick = 0;
-    running_status = 0;
-
-    while(1)
-    {
-        // Si pulsamos SPACE, salir
-        if ((SEMIFILA8 & 0x1) == 0)
-          return;
-
-        // Si al recorrer el buffer con pos, pasamos de una mitad a otra del buffer, recargamos de fichero la mitad que acabamos de usar
-        if ((pos&0x200) != (ppos&0x200))
-        {
-            if (pos&0x200)
-                read (f, buffer, 512);
-            else
-                read (f, buffer+512, 512);
-            ppos = pos;
-        }
-
-        // Leemos y calculamos el delta (numero de ticks del reloj MIDI que han de pasar desde ahora) del evento actual
-        delta = 0;
-        do
-        {
-            c = buffer[pos];
-            pos = (pos + 1) & 0x3FF;
-            delta = (delta<<7) | (c &0x7F);
-        }
-        while(c & 0x80);
-
-        // Si delta especifica un tiempo superior a 0...
-        if (delta)
-        {
-           // ajustamos delta segun la precisión (aritmética de punto fijo)
-           delta *= PRECISION;
-           // cada interrupción dura ticks_per_int ticks de reloj MIDI. Con este bucle esperamos un
-           // numero de interrupciones que sea igual o algo mayor al que dicte el numero de ticks en delta.
-           while (tick < delta)
-           {
-               if ((SEMIFILA8 & 0x1) == 0)
-                  return;
-               WAIT_VRETRACE;
-               tick += ticks_per_int;
-           }
-           tick -= delta;  // ajustamos tick por si hemos esperado más de la cuenta (para compensar)
-        }
-        // si lo que hay tras el delta es un byte de estado (con bit 7=1), entonces cancelamos running status
-        if (buffer[pos] & 0x80)
-        {
-            running_status = 0;
-            status = buffer[pos];
-        }
-        else // per si no, entonces status no se actualiza y señalamos que hay running status
-            running_status = 1;
-
-        // ahora, según el valor de status, estamos ante un evento u otro. Los procesamos.
-        
-        // EVENTOS F0 y F7. Se usan para enviar SYSEX y datos arbitrarios al secuenciador. Los pasmos tal cual.
-        if (status == 0xF0 || status == 0xF7)
-        {
-          pos = (pos + 1) & 0x3FF;
-          lbytes = 0;
-          do
-          {
-              c = buffer[pos];
-              pos = (pos + 1) & 0x3FF;
-              lbytes = (lbytes<<7) | (c & 0x7F);
-          }
-          while (c & 0x80);
-
-          if (status == 0xF0)
-          {
-            SendMIDI (&status, 1);
-            SendMIDI (buffer+pos, lbytes);
-          }
-          else
-          {
-            SendMIDI (buffer+pos, lbytes);
-          }
-          pos = (pos + lbytes) & 0x3FF;
-          continue;
-        }
-
-        // EVENTOS 8n, 9n, An, Bm, Cn, Dn, En y Fn. Si es alguno de estos, se envia el evento MIDI asociado.
-        // En estos eventos se ha de tener en cuenta el running status para enviar 1, 2 o 3 bytes según sea el caso.
-        c = (status>>4) & 0xF;
-        if (c == 0x8 || c == 0x9 || c == 0xA || c == 0xB || c == 0xE)
-        {
-            if (running_status == 0)
-            {
-                SendMIDI (buffer+pos, 3);
-                pos = (pos + 3) & 0x3FF;
-            }
-            else
-            {
-                SendMIDI (buffer+pos, 2);
-                pos = (pos + 2) & 0x3FF;
-            }
-            continue;
-        }
-        if (c == 0xC || c == 0xD)
-        {
-            if (running_status == 0)
-            {
-                SendMIDI (buffer+pos, 2);
-                pos = (pos + 2) & 0x3FF;
-            }
-            else
-            {
-                SendMIDI (buffer+pos, 1);
-                pos = (pos + 1) & 0x3FF;
-            }
-            continue;
-        }
-
-        // EVENTOS que necesitan un primer parámetro
-        // estos eventos serán ignorados
-        pos = (pos + 1) & 0x3FF;
-        param1 = buffer[pos];
-        if (status == 0xFF && ((param1 >= 0x01 && param1 <= 0x07) || param1 == 0x7F))
-        {
-            pos = (pos + 1) & 0x3FF;
-            lbytes = 0;
-            do
-            {
-                c = buffer[pos];
-                pos = (pos + 1) & 0x3FF;
-                lbytes = (lbytes<<7) | (c & 0x7F);
-            }
-            while (c & 0x80);
-
-            pos = (pos + lbytes) & 0x3FF;
-            continue;
-        }
-
-        // EVENTOS que necesitan un segundo parámetro
-        pos = (pos + 1) & 0x3FF;
-        param2 = buffer[pos];
-        if (status == 0xFF)
-        {
-            if (param1 == 0x2F && param2 == 0x00)  // Meta evento de FIN DE PISTA. Terminar con el bucle de reproducción
-                break;
-            if (param1 == 0x51 && param2 == 0x03)  // Meta evento Set Tempo.
-            {
-                us_per_quarter = 0;
-                for (i=0;i<3;i++)                  // Leemos los 24 bits que forman el nuevo valor de us_per_quarter
-                {
-                    pos = (pos + 1) & 0x3FF;
-                    us_per_quarter = (us_per_quarter<<8) | buffer[pos];
-                }
-                pos = (pos + 1) & 0x3FF;
-                ticks_per_int = PRECISION * 20000L * ppq / us_per_quarter;  // y calculamos el nuevo valor de ticks_per_int
-            }
-            // El resto de meta eventos se ignora. No sé si hago bien en ignorarlos todos, pero de momento, parece que ningún MIDI se ha quejado
-            if (param1 == 0x00 && param2 == 0x02)
-            {
-                pos = (pos + 3) & 0x3FF;
-            }
-            if (param1 == 0x20 && param2 == 0x01)
-            {
-                pos = (pos + 2) & 0x3FF;
-            }
-            if (param1 == 0x21 && param2 == 0x01)
-            {
-                pos = (pos + 2) & 0x3FF;
-            }
-            if (param1 == 0x54 && param2 == 0x05)
-            {
-                pos = (pos + 6) & 0x3FF;
-            }
-            if (param1 == 0x58 && param2 == 0x04)
-            {
-                pos = (pos + 5) & 0x3FF;
-            }
-            if (param1 == 0x59 && param2 == 0x02)
-            {
-                pos = (pos + 3) & 0x3FF;
-            }
-            continue;
-        }
-    }
+    fhandle = f;
+    playmidi1 (buffer[10] ? MAX_TRACKS : buffer[11]);   // numero de pistas de la cabecera (topado a MAX_TRACKS)
 }
 
 // Rutina para comparar rapidamente dos bloques de memoria de 4 bytes
@@ -461,7 +562,7 @@ int cmp4b (BYTE *a, BYTE *b)
 #pragma disable_warning 59
 
 // Envia un bloque de memoria a la salida MIDI del Spectrum
-void SendMIDI (BYTE *ev, BYTE lev)
+void SendMIDI (BYTE *ev, BYTE lev) STACKARGS
 {
   BYTE d;
 
@@ -592,7 +693,7 @@ void getfilename (char *p, char *fname)
 #pragma disable_warning 85
 #pragma disable_warning 59
 
-void puts (BYTE *str)
+void puts (BYTE *str) STACKARGS
 {
   __asm
   push bc
@@ -675,10 +776,10 @@ void __sdcc_enter_ix (void) __naked
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////
-// RUTINAS ESXDOS (sólo las que necesito en este programa, por lo que no están ni seek ni write
+// RUTINAS ESXDOS (sólo las que necesito en este programa, por lo que no está write)
 ///////////////////////////////////////////////////////////////////////////////////////////
 
-BYTE open (char *filename, BYTE mode)
+BYTE open (char *filename, BYTE mode) STACKARGS
 {
     __asm
     push bc
@@ -701,7 +802,7 @@ open_ok:
     __endasm;
 }
 
-void close (BYTE handle)
+void close (BYTE handle) STACKARGS
 {
     __asm
     push bc
@@ -714,7 +815,34 @@ void close (BYTE handle)
     __endasm;
 }
 
-WORD read (BYTE handle, BYTE *buffer, WORD nbytes)
+// Posiciona el puntero de lectura del fichero en un offset absoluto desde el principio.
+// El esxdos original espera el modo de seek en IXL; el API compatible de NextZXOS lo
+// espera en L. Ponemos 0 (SEEK_START) en ambos para funcionar en los dos.
+void seekset (BYTE handle, DWORD offset) STACKARGS
+{
+    __asm
+    push bc
+    push de
+    ld a,4(ix)  ;File handle in A
+    ld e,5(ix)
+    ld d,6(ix)
+    ld c,7(ix)
+    ld b,8(ix)  ;Offset in BCDE (B=MSB, E=LSB)
+    push ix
+    ld ix,#0    ;IXL=0: seek from start (esxdos)
+    ld l,#0     ;L=0: seek from start (NextZXOS)
+    rst #8
+    .db #F_SEEK
+    pop ix
+    jr nc,seek_ok
+    ld (#_errno),a
+seek_ok:
+    pop de
+    pop bc
+    __endasm;
+}
+
+WORD read (BYTE handle, BYTE *buffer, WORD nbytes) STACKARGS
 {
     __asm
     push bc
