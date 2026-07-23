@@ -64,9 +64,9 @@ static void settempo (void)   /* mirror of the Z80 build: 16.16 ticks per frame 
 {
     DWORD d;
     if (!us_per_quarter || !ppq) return;
-    d = us_per_quarter / ppq;
+    d = us_per_quarter * 2 / ppq;   /* us per tick at double scale, like the Z80 build */
     if (!d) d = 1;
-    d = ((DWORD)us_per_int << 16) / d;
+    d = ((DWORD)us_per_int << 17) / d;
     ticks_per_int = d >> 10;
     tpi_frac = (BYTE)((WORD)d >> 2);
 }
@@ -124,7 +124,7 @@ int main (int argc, char **argv)
     if (!cmp4b (buffer, (BYTE*)"MThd")) { fprintf (stderr, "no MThd\n"); return 1; }
     if (buffer[9] > 1) { fprintf (stderr, "unsupported format\n"); return 1; }
 
-    us_per_int = 20000;
+    us_per_int = getenv("USPI") ? atoi(getenv("USPI")) : 20000;  /* override to match an emu run */
     ppq = buffer[12]<<8 | buffer[13];
     if (buffer[12] & 0x80)
     {

@@ -21,10 +21,10 @@ def simulate(fname):
     def tpi_calc(us):
         # mirror of the engine's settempo: 16.16 ticks per frame, split into an
         # integer part at PRECISION=64 plus an 8-bit fraction (1/256ths of a unit)
-        d = us // ppq
+        d = us * 2 // ppq             # us per tick at double scale, like the engine
         if d == 0:
             d = 1
-        t = (20000 << 16) // d
+        t = (20000 << 17) // d
         return [t >> 10, (t >> 2) & 0xFF]
 
     ticks_per_int = tpi_calc(500000)         # [integer, fraction/1024]

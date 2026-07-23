@@ -6,6 +6,10 @@
 #include <string.h>
 #include "z80.h"
 
+#ifndef INTT               /* T-states per frame: 69888=48K, 70908=128K, 71680=Pentagon */
+#define INTT 69888
+#endif
+
 static uint8_t mem[65536];
 static uint8_t banks[8][0x4000];        /* 128K RAM banks, window at 0xC000 */
 static uint8_t curbank = 0;
@@ -179,6 +183,7 @@ int main (int argc, char **argv)
                     prof[bi] = 0;
                 }
             }
+            fprintf(stderr, "USPI=%u\n", mem[0x30F6] | (mem[0x30F7] << 8));  /* us_per_int the player calibrated */
             fprintf(stderr, "EXIT: L=%02X carry=%d after %lu frames, %lu syscalls, %lu midi port writes, %lu canary writes, %lu bank switches, final bank %u (%s)\n",
                     z.l, z.cf, frames, syscalls, midi_outs, canary_writes, bank_switches, curbank,
                     curbank == (mem[23388] & 7) ? "restored OK" : "NOT RESTORED");
@@ -221,7 +226,7 @@ int main (int argc, char **argv)
             if (!was_halted) prof[ppc >> 8] += z.cyc - c0;
         }
         steps++;
-        if (z.cyc - last_int > 69888) {        /* 50 Hz frame */
+        if (z.cyc - last_int > INTT) {         /* one video frame */
             last_int = z.cyc;
             frames++;
             /* ROM ISR increments FRAMES (23672, 3 bytes) */

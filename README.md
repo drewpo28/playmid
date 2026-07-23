@@ -42,7 +42,7 @@ Requires SDCC 4.x with the Z80 backend (`makebin` ships with it):
 
 ```sh
 sdcc -mz80 --reserve-regs-iy --opt-code-size --max-allocs-per-node 100000 \
-  --nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2ea8 \
+  --nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2eb0 \
   playmid.c z80.lib -L /path/to/sdcc/lib/z80
 makebin -s 65535 -p playmid.ihx playmid.bin
 dd if=playmid.bin of=PLAYMID bs=1 skip=8192

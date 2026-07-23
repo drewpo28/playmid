@@ -21,7 +21,7 @@ Compilar con SDCC 4.x, con la convencion de llamada por defecto (NO usar --sdccc
 z80.lib viene compilada con la convencion por registros y las rutinas de multiplicacion/division
 recibirian basura; las funciones con ensamblador incrustado ya van marcadas con __sdcccall(0)):
 sdcc -mz80 --reserve-regs-iy --opt-code-size --max-allocs-per-node 100000 \
---nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2ea8 playmid.c z80.lib -L /path/to/sdcc/lib/z80
+--nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2eb0 playmid.c z80.lib -L /path/to/sdcc/lib/z80
 makebin -s 65535 -p playmid.ihx playmid.bin
 dd if=playmid.bin of=PLAYMID bs=1 skip=8192
 
@@ -31,8 +31,8 @@ _HOME termina antes de 0x3000 (donde empieza el buffer). El presupuesto esta apu
 escalares globales vive dentro del buffer (declaraciones __at mas abajo) para liberar sitio en 0x2000-0x2FFF.
 
 MAPA DE MEMORIA (DivMMC RAM, 0x2000-0x3FFF):
-  0x2000-0x2EA7 : codigo + literales
-  0x2EA8-0x2FFF : datos (variables globales, estado de pistas) + codigo de libreria (_HOME)
+  0x2000-0x2EAF : codigo + literales
+  0x2EB0-0x2FFF : datos (variables globales, estado de pistas) + codigo de libreria (_HOME)
   0x3000-0x33FF : buffer de 1KB: staging de salida, ISR y tabla IM2, staging L2,
                   escalares globales y cachés de lectura repartidas entre las pistas
   0x3400-0x3FFF : NO TOCAR. Lanzadores de comandos como el LNF Browser guardan aqui su
@@ -387,10 +387,15 @@ void settempo (void)
 {
     if (us_per_quarter && ppq)
     {
-        dtmp = us_per_quarter / ppq;            // us per MIDI tick, like ZMP's tempo/ppqn
+        // us per MIDI tick at double scale, like ZMP's tempo/ppqn but with one
+        // extra bit: plain integer truncation biased high-ppq files audibly fast
+        // (500000/960 -> 520 was +0.16% of tempo; the extra bit halves that)
+        dtmp = us_per_quarter;
+        dtmp += dtmp;
+        dtmp /= ppq;
         if (!dtmp)
             dtmp = 1;
-        dtmp = ((DWORD)us_per_int << 16) / dtmp;   // ticks per frame, 16.16 fixed point
+        dtmp = ((DWORD)us_per_int << 17) / dtmp;   // ticks per frame, 16.16 fixed point
         ticks_per_int = dtmp >> 10;             // integer part at PRECISION=64...
         tpi_frac = (BYTE)((WORD)dtmp >> 2);     // ...plus a fraction in 256ths of a unit
     }
@@ -398,8 +403,9 @@ void settempo (void)
 
 // Measures the machine's frame duration: counts 35-T-state iterations across 2
 // frames (between int_cnt edges, with our IM2 clock already running) and returns
-// count*5, which is the frame length in us if the clock is an exact 3.50MHz
-// (35 T / 2 frames / 3.5 MHz = 5 us per iteration).
+// count*5 - 19000: the frame length in us if the clock is an exact 3.50MHz
+// (35 T / 2 frames / 3.5 MHz = 5 us per iteration), relative to 19.0ms because
+// the caller's plausibility windows are expressed that way.
 WORD meas (void) STACKARGS
 {
     __asm
@@ -423,6 +429,8 @@ mea_loop:
     add hl,hl           ;HL = count*2
     add hl,hl           ;HL = count*4
     add hl,de           ;HL = count*5 = us per frame at 3.50MHz
+    ld de,#-19000
+    add hl,de           ;HL = us-19000 (the caller windows are relative to 19.0ms)
     pop bc
     __endasm;
 }
@@ -693,7 +701,6 @@ void trk_event (void)
     // EVENTOS de canal: estado + 1 o 2 bytes de datos, via staging. Si el estado
     // coincide con el último enviado por el cable, se omite (running status de salida):
     // a 31250 baudios cada byte ahorrado son 320us, y en los pasajes densos se nota.
-    c = st & 0xF0;
     n = 0;
     if (st != wire_status)
     {
@@ -701,7 +708,7 @@ void trk_event (void)
         buffer[n++] = st;
     }
     buffer[n++] = (b != 0xFF) ? b : trk_get();
-    if (c != 0xC0 && c != 0xD0)
+    if ((st & 0xE0) != 0xC0)       // C0 (program) y D0 (pressure) llevan 1 solo dato
         buffer[n++] = trk_get();
     SendMIDI (buffer, n);
 }
@@ -795,14 +802,12 @@ BYTE playmidi1 (BYTE ntrk)
 {
     BYTE best;
 
-    if (ntrk > MAX_TRACKS)
-        ntrk = MAX_TRACKS;
-
     // L2 ring per track: the largest power of two such that all the tracks fit in
     // the 64KB of banks (a power of two makes every ring wrap a masking operation).
     // Sized from the header's track count, so scan_tracks can hand out ring bases.
+    // (The "i &&" guard stops the loop when i wraps to 0 on absurd track counts.)
     l2_area = 0x8000;                      // 1-2 tracks: two 32KB halves
-    for (i = 2; i < ntrk; i <<= 1)
+    for (i = 2; i && i < ntrk; i <<= 1)
         l2_area >>= 1;
     lmask = l2_area - 1;
     sd_trk = 0xFF;
@@ -928,7 +933,7 @@ void playmidi (BYTE f)
     // 128K family (3.5469MHz crystal, 70908 T = 19.99ms) shows up as an inflated
     // count in a window of its own and gets snapped to the exact value.
     im2_on ();
-    rem = meas () - 19000;              // us per frame minus 19000, at an exact 3.50MHz clock
+    rem = meas ();                      // us per frame minus 19000, at an exact 3.50MHz clock
     im2_off ();
     if (rem > 2000)
         rem = 1000;                     // wild reading (turbo, NTSC...): assume 50Hz as before

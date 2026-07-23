@@ -55,7 +55,7 @@ fails = 0
 for seed in range(30):
     rng = random.Random(seed)
     ntrk = rng.randint(1, 17)
-    ppq = rng.choice([96, 192, 384, 480, 960])
+    ppq = rng.choice([24, 48, 96, 192, 384, 480, 960])   # low ppq: worst case for the fractional tick rate
     trks = [track(rand_track(rng, tn % 16)) for tn in range(ntrk)]
     fn = 'fuzz.mid'
     open(fn, 'wb').write(smf1(ppq, trks))

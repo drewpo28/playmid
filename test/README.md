@@ -32,4 +32,8 @@ gcc -O2 -o emu emu.c z80.c
 
 `emu` prints one line per MIDI byte (`<frame> <hex>`) when given the
 `_SendMIDIByte` address from the linker map, so the real Z80 binary's output
-can be diffed against `host_test`'s.
+can be diffed against `host_test`'s. Build it with `-DINTT=71680` (Pentagon)
+or `70908` (128K) to emulate other frame lengths and exercise the player's
+frame calibration; it reports the calibrated value as `USPI=...` on exit, and
+`USPI=<value> ./host_test file.mid` makes the harness use the same frame
+length so the two byte streams compare byte-for-byte even on dense files.
