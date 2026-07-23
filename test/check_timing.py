@@ -16,38 +16,57 @@ def simulate(fname):
         ln = struct.unpack('>I', raw[pos+4:pos+8])[0]
         tracks.append(parse_track(raw[pos+8:pos+8+ln]))
         pos += 8 + ln
+    tracks = tracks[:17]                     # MAX_TRACKS
 
-    ticks_per_int = PRECISION * 20 * ppq // 500
+    ticks_per_int = [PRECISION * 20 * ppq // 500]
     now = 0          # scaled
     ints = 0
     idx = [0]*len(tracks)
     out = []
-    while True:
-        best, besttick = -1, None
-        for ti, tr in enumerate(tracks):
-            if idx[ti] >= len(tr): continue
-            tk = tr[idx[ti]][0]
-            if besttick is None or tk < besttick:
-                best, besttick = ti, tk
-        if best < 0: break
-        tick, kind, payload = tracks[best][idx[best]]
-        idx[best] += 1
-        target = tick * PRECISION
-        while now < target:
-            ints += 1
-            now += ticks_per_int
+    wire = [None]    # wire running status
+
+    def emit(kind, payload):
         if kind == 'ch':
-            out.append((ints, payload))
+            if payload[0] == wire[0]:
+                out.append((ints, payload[1:]))
+            else:
+                wire[0] = payload[0]
+                out.append((ints, payload))
         elif kind == 'sysex0':
+            wire[0] = None
             out.append((ints, bytes([0xF0])))
             if payload: out.append((ints, payload))
         elif kind == 'sysex7':
+            wire[0] = None
             if payload: out.append((ints, payload))
         elif kind == 'meta':
             if payload[0] == 0x51 and len(payload) == 4:
                 us = int.from_bytes(payload[1:4], 'big')
                 if us:
-                    ticks_per_int = PRECISION * 20000 * ppq // us
+                    ticks_per_int[0] = PRECISION * 20000 * ppq // us
+
+    # frame-sweep scheduler, mirror of the engine (zx-midiplayer style):
+    # once per frame visit every track in order; a due track drains all its
+    # pending events until its next tick is in the future
+    live = sum(1 for tr in tracks if tr)
+    for ti, tr in enumerate(tracks):
+        if not tr: live -= 0
+    while live > 0:
+        ints += 1
+        now += ticks_per_int[0]
+        for ti, tr in enumerate(tracks):
+            if idx[ti] >= len(tr):
+                continue
+            if tr[idx[ti]][0] * PRECISION > now:
+                continue
+            while idx[ti] < len(tr) and tr[idx[ti]][0] * PRECISION <= now:
+                tick, kind, payload = tr[idx[ti]]
+                idx[ti] += 1
+                emit(kind, payload)
+                if kind == 'meta' and payload[0] == 0x2F:
+                    idx[ti] = len(tr)
+            if idx[ti] >= len(tr):
+                live -= 1
     return out
 
 if __name__ == '__main__':

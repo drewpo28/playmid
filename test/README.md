@@ -23,7 +23,7 @@ python3 fuzz.py
 # 6. run the actual PLAYMID binary under Z80 emulation with esxdos traps
 #    (needs z80.c/z80.h from https://github.com/superzazu/z80)
 gcc -O2 -o emu emu.c z80.c
-./emu ../PLAYMID file.mid [max_frames] [SendMIDIByte-addr-hex from .map]
+./emu ../PLAYMID file.mid [max_frames] [SendMIDIByte-addr-hex from .map] [start-with-DI]
 ```
 
 `emu` prints one line per MIDI byte (`<frame> <hex>`) when given the

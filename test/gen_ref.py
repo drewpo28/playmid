@@ -94,8 +94,12 @@ def parse_track(data):
         tick += delta
         b = data[pos]
         if b & 0x80:
-            status = b; pos += 1
-        st = status
+            pos += 1
+            st = b
+            if b < 0xF0:
+                status = b
+        else:
+            st = status
         if st == 0xF0 or st == 0xF7:
             ln = 0
             while True:

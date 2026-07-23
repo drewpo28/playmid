@@ -16,8 +16,8 @@ typedef unsigned short WORD;
 typedef uint32_t DWORD;
 
 #define PRECISION 64
-#define MAX_TRACKS   24
-#define TCACHE_TOTAL 960
+#define MAX_TRACKS   17
+#define TCACHE_TOTAL 510
 
 /* globals shared with the engine (declared in playmid.c outside the markers) */
 BYTE i, c;
@@ -29,13 +29,28 @@ BYTE buffer[1024];
 BYTE tcaches[TCACHE_TOTAL];
 BYTE fhandle;
 BYTE errno_;
+static BYTE banks64[65536];
+static void bankmove (WORD woff, BYTE *p, WORD n, BYTE wr)
+{
+    if (wr) memcpy(banks64 + woff, p, n); else memcpy(p, banks64 + woff, n);
+}
+#define L2STAGE      (buffer+0x3C)
+#define L2STAGE_SIZE 196
+static DWORD muldw (DWORD a, WORD b) { return a * (DWORD)b; }
+DWORD os_pos;
+static void seekset (BYTE handle, DWORD offset);
+static void seekpos (DWORD off) { if (off != os_pos) { seekset(0, off); os_pos = off; } }
+static void settempo (void) { if (us_per_quarter) ticks_per_int = muldw(1280000UL, (WORD)ppq) / us_per_quarter; }
 
 static FILE *F;
 static unsigned long sim_ints = 0;
 static unsigned long n_seeks = 0, n_reads = 0;
 
 #define SEMIFILA8 0xFF                 /* SPACE never pressed */
-#define WAIT_VRETRACE sim_ints++
+volatile BYTE int_cnt; BYTE cnt_last; BYTE im2_active;
+static void im2_on (void) { im2_active = 1; cnt_last = int_cnt; }
+static void im2_off (void) { im2_active = 0; }
+#define WAIT_VRETRACE (sim_ints++, int_cnt++)
 
 static WORD read (BYTE handle, BYTE *buf, WORD nbytes)
 {

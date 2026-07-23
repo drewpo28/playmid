@@ -7,8 +7,12 @@
 #include "z80.h"
 
 static uint8_t mem[65536];
+static uint8_t banks[8][0x4000];        /* 128K RAM banks, window at 0xC000 */
+static uint8_t curbank = 0;
+static unsigned long bank_switches = 0;
 static FILE *fhs[16];
 static unsigned long midi_outs = 0, frames = 0, syscalls = 0;
+static unsigned long long prof[256];   /* cycles per 256-byte PC bucket */
 static int trace = 1;
 
 #define HOOK_BASE 128
@@ -21,17 +25,33 @@ static int trace = 1;
 #define F_WRITE (FSYS_BASE+6)
 #define F_SEEK  (FSYS_BASE+7)
 
-static uint8_t rb(void *ud, uint16_t a) { (void)ud; return mem[a]; }
+/* real 128K memory model: 0x4000-0x7FFF = bank 5 (the screen lives here!),
+   0x8000-0xBFFF = bank 2, 0xC000-0xFFFF = switchable bank */
+static uint8_t *maddr(uint16_t a) {
+    if (a >= 0xC000) return &banks[curbank][a - 0xC000];
+    if (a >= 0x8000) return &banks[2][a - 0x8000];
+    if (a >= 0x4000) return &banks[5][a - 0x4000];
+    return &mem[a];
+}
+#define RD(a) (*maddr((uint16_t)(a)))
+static uint8_t rb(void *ud, uint16_t a) { (void)ud; return RD(a); }
 static unsigned long canary_writes = 0;
 static void wb(void *ud, uint16_t a, uint8_t v) {
     (void)ud;
-    if (a >= 0x3400 && a <= 0x3FFF && canary_writes++ < 5)
-        fprintf(stderr, "[CANARY] write %02X to %04X\n", v, a);
-    mem[a] = v;
+    if (((a >= 0x3400 && a <= 0x3FFF) || (a >= 0x4000 && a <= 0x5AFF)) && canary_writes++ < 8)
+        fprintf(stderr, "[CANARY] write %02X to %04X (cpu)\n", v, a);
+    if (a >= 0xC000 && (curbank == 5 || curbank == 7 || curbank == 2) && canary_writes++ < 8)
+        fprintf(stderr, "[CANARY] write %02X to banked 0x%04X with FORBIDDEN bank %u mapped\n", v, a, curbank);
+    *maddr(a) = v;
 }
 static uint8_t pin(z80 *z, uint8_t port) { (void)z; (void)port; return 0xFF; }
 static void pout(z80 *z, uint8_t port, uint8_t v) {
-    (void)z; (void)v;
+    uint16_t full = ((uint16_t)z->b << 8) | port;
+    if ((full & 0x8002) == 0) {      /* 128K memory port 0x7FFD */
+        curbank = v & 7;
+        bank_switches++;
+        return;
+    }
     if (port == 0xFD) midi_outs++;   /* AY / MIDI bit-bang activity */
 }
 
@@ -48,7 +68,7 @@ static void esx (z80 *z, uint8_t call)
     case F_OPEN: {
         char name[64]; int k = 0;
         uint16_t p = hl(z);
-        while (k < 63 && mem[p]) name[k++] = mem[p++];
+        while (k < 63 && RD(p)) { name[k++] = RD(p); p++; }
         name[k] = 0;
         int h = -1;
         for (int j = 4; j < 16; j++) if (!fhs[j]) { h = j; break; }
@@ -85,11 +105,22 @@ static void esx (z80 *z, uint8_t call)
         z->b = (np >> 24) & 0xFF; z->c = (np >> 16) & 0xFF; z->d = (np >> 8) & 0xFF; z->e = np & 0xFF;
         z->cf = 0; break;
     }
-    default:
-        fprintf(stderr, "[esx] UNIMPLEMENTED call %02X\n", call);
+    default: {
+        extern uint16_t pcring[64]; extern int pcri; extern int pcdumped;
+        fprintf(stderr, "[esx] UNIMPLEMENTED call %02X (ret addr %04X, sp %04X)\n", call,
+                (unsigned)(RD(z->sp-2) | (RD(z->sp-1)<<8)), z->sp);
+        if (!pcdumped) {
+            pcdumped = 1;
+            fprintf(stderr, "[pc history]");
+            for (int k = 0; k < 64; k++) fprintf(stderr, " %04X", pcring[(pcri + k) & 63]);
+            fprintf(stderr, "\n");
+        }
+        break; }
         z->a = 1; z->cf = 1; break;
     }
 }
+
+uint16_t pcring[64]; int pcri = 0; int pcdumped = 0;
 
 int main (int argc, char **argv)
 {
@@ -105,9 +136,9 @@ int main (int argc, char **argv)
     fprintf(stderr, "loaded %zu bytes at 0x2000\n", sz);
 
     /* command line at 0x9000, terminated by 0x0D */
-    uint16_t cl = 0x9000;
-    strcpy((char *)mem + cl, argv[2]);
-    mem[cl + strlen(argv[2])] = 0x0D;
+    uint16_t cl = 0x9000;   /* 0x8000-0xBFFF = bank 2 */
+    strcpy((char *)banks[2] + (cl - 0x8000), argv[2]);
+    banks[2][cl - 0x8000 + strlen(argv[2])] = 0x0D;
 
     /* IM1 handler stub: EI ; RET */
     mem[0x0038] = 0xFB; mem[0x0039] = 0xC9;
@@ -117,24 +148,39 @@ int main (int argc, char **argv)
     z.read_byte = rb; z.write_byte = wb; z.port_in = pin; z.port_out = pout;
     z.pc = 0x2000;
     z.sp = 0xFF00 - 2;
-    mem[0xFEFE] = 0x00; mem[0xFEFF] = 0x00;   /* return-to-0 sentinel */
+    banks[0][0x3EFE] = 0x00; banks[0][0x3EFF] = 0x00;   /* return-to-0 sentinel (bank 0 at 0xC000) */
+    banks[5][23388 - 0x4000] = 0x10;                    /* BANKM (0x5B5C, bank 5): paging unlocked, bank 0 */
     z.h = cl >> 8; z.l = cl & 0xFF;
     z.iy = 0x5C3A;
     z.iff1 = z.iff2 = !start_di;
     z.interrupt_mode = 1;
 
+    int dbg = (getenv("EMUDBG") != 0);
     unsigned long last_int = 0;
     unsigned long steps = 0;
     while (1) {
         if (z.pc == 0x0000) {
-            fprintf(stderr, "EXIT: L=%02X carry=%d after %lu frames, %lu syscalls, %lu midi port writes, %lu canary writes\n",
-                    z.l, z.cf, frames, syscalls, midi_outs, canary_writes);
+            {
+                unsigned long long tot = 0;
+                for (int k = 0; k < 256; k++) tot += prof[k];
+                fprintf(stderr, "profile (cycles by PC page, top 12):\n");
+                for (int r = 0; r < 12; r++) {
+                    int bi = 0;
+                    for (int k = 1; k < 256; k++) if (prof[k] > prof[bi]) bi = k;
+                    if (!prof[bi]) break;
+                    fprintf(stderr, "  %02XXX: %llu (%.1f%%)\n", bi, prof[bi], 100.0*prof[bi]/tot);
+                    prof[bi] = 0;
+                }
+            }
+            fprintf(stderr, "EXIT: L=%02X carry=%d after %lu frames, %lu syscalls, %lu midi port writes, %lu canary writes, %lu bank switches, final bank %u (%s)\n",
+                    z.l, z.cf, frames, syscalls, midi_outs, canary_writes, bank_switches, curbank,
+                    curbank == (mem[23388] & 7) ? "restored OK" : "NOT RESTORED");
             break;
         }
         if (z.pc == 0x0008) {
-            uint16_t ret = mem[z.sp] | (mem[z.sp + 1] << 8);
+            uint16_t ret = RD(z.sp) | (RD(z.sp + 1) << 8);
             z.sp += 2;
-            uint8_t call = mem[ret];
+            uint8_t call = RD(ret);
             esx(&z, call);
             z.pc = ret + 1;
             continue;
@@ -143,7 +189,7 @@ int main (int argc, char **argv)
             printf("%lu %02X\n", frames, z.a);
         }
         if (z.pc == 0x0010) {
-            uint16_t ret = mem[z.sp] | (mem[z.sp + 1] << 8);
+            uint16_t ret = RD(z.sp) | (RD(z.sp + 1) << 8);
             z.sp += 2;
             fputc(z.a == 0x0D ? '\n' : z.a, stderr);
             z.pc = ret;
@@ -158,11 +204,21 @@ int main (int argc, char **argv)
                 iy_hits++;
             }
         }
-        z80_step(&z);
+        {
+            uint16_t ppc = z.pc;
+            pcring[pcri] = ppc; pcri = (pcri + 1) & 63;
+            if (dbg && steps < 400) fprintf(stderr, "[pc] %04X a=%02X hl=%02X%02X sp=%04X\n", z.pc, z.a, z.h, z.l, z.sp);
+            unsigned long c0 = z.cyc;
+            int was_halted = z.halted;
+            z80_step(&z);
+            if (!was_halted) prof[ppc >> 8] += z.cyc - c0;
+        }
         steps++;
         if (z.cyc - last_int > 69888) {        /* 50 Hz frame */
             last_int = z.cyc;
             frames++;
+            /* ROM ISR increments FRAMES (23672, 3 bytes) */
+            if (++mem[23672] == 0 && ++mem[23673] == 0) ++mem[23674];
             if (frames > max_frames) { fprintf(stderr, "TIMEOUT after %lu frames, %lu syscalls, %lu midi outs\n", frames, syscalls, midi_outs); break; }
             if (frames % 500 == 0 && trace) fprintf(stderr, "[t] frame %lu, midi outs %lu, pc=%04X\n", frames, midi_outs, z.pc);
             z80_gen_int(&z, 0xFF);

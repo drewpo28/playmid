@@ -39,11 +39,9 @@ def rand_track(rng, ch):
         elif kind < 0.93:
             txt = bytes(rng.randint(32, 126) for _ in range(rng.randint(0, 200)))
             ev.append((d, bytes([0xFF, rng.choice([1,2,3,4,5,6,7,0x7F])]) + vlq(len(txt)) + txt))
-            last_status = None   # sysex/meta cancel running status in the file
         elif kind < 0.97:
             us = rng.randint(200000, 1200000)
             ev.append((d, bytes([0xFF, 0x51, 0x03]) + struct.pack('>I', us)[1:]))
-            last_status = None
         else:
             payload = bytes(rng.randint(0, 127) for _ in range(rng.randint(0, 300)))
             if rng.random() < 0.5:
@@ -56,7 +54,7 @@ def rand_track(rng, ch):
 fails = 0
 for seed in range(30):
     rng = random.Random(seed)
-    ntrk = rng.randint(1, 24)
+    ntrk = rng.randint(1, 17)
     ppq = rng.choice([96, 192, 384, 480, 960])
     trks = [track(rand_track(rng, tn % 16)) for tn in range(ntrk)]
     fn = 'fuzz.mid'
