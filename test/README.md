@@ -20,6 +20,10 @@ python3 check_timing.py file.mid file.out
 # 5. randomized differential test (30 seeds) engine-vs-reference
 python3 fuzz.py
 
+# 5b. L2 ring-buffer stress: files far larger than the per-track bank window,
+#     so the ring pointers wrap around several times (byte- and timing-exact)
+python3 stress_ring.py
+
 # 6. run the actual PLAYMID binary under Z80 emulation with esxdos traps
 #    (needs z80.c/z80.h from https://github.com/superzazu/z80)
 gcc -O2 -o emu emu.c z80.c

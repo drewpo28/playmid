@@ -17,7 +17,7 @@ typedef uint32_t DWORD;
 
 #define PRECISION 64
 #define MAX_TRACKS   17
-#define TCACHE_TOTAL 510
+#define TCACHE_TOTAL 356
 
 /* globals shared with the engine (declared in playmid.c outside the markers) */
 BYTE i, c;
@@ -29,18 +29,47 @@ BYTE buffer[1024];
 BYTE tcaches[TCACHE_TOTAL];
 BYTE fhandle;
 BYTE errno_;
+/* state the Z80 build keeps at absolute addresses in the buffer page */
+typedef struct {
+    DWORD off;
+    DWORD l2end;
+    WORD  bank;
+    BYTE  cpos;
+    BYTE  clen;
+} TRKST;
+TRKST tst[MAX_TRACKS];
+TRKST cur;
+TRKST *curstate, *pst;
+BYTE tracks, curtrk, trkn, fired, wire_status;
+DWORD trk_next[MAX_TRACKS];
+BYTE l2_eof[MAX_TRACKS], trk_status[MAX_TRACKS], trk_end[MAX_TRACKS];
+WORD tcsize, l2_area, rem, remt, lmask, fillb, xn;
+BYTE pick, sd_trk;
+DWORD now;
+DWORD *pnext;
+BYTE *rdptr, *rdend, *cptr;
 static BYTE banks64[65536];
 static void bankmove (WORD woff, BYTE *p, WORD n, BYTE wr)
 {
     if (wr) memcpy(banks64 + woff, p, n); else memcpy(p, banks64 + woff, n);
 }
 #define L2STAGE      (buffer+0x3C)
-#define L2STAGE_SIZE 196
-static DWORD muldw (DWORD a, WORD b) { return a * (DWORD)b; }
+#define L2STAGE_SIZE 128
 DWORD os_pos;
 static void seekset (BYTE handle, DWORD offset);
 static void seekpos (DWORD off) { if (off != os_pos) { seekset(0, off); os_pos = off; } }
-static void settempo (void) { if (us_per_quarter) ticks_per_int = muldw(1280000UL, (WORD)ppq) / us_per_quarter; }
+BYTE tpi_frac, tfrac;
+WORD us_per_int;
+static void settempo (void)   /* mirror of the Z80 build: 16.16 ticks per frame */
+{
+    DWORD d;
+    if (!us_per_quarter || !ppq) return;
+    d = us_per_quarter / ppq;
+    if (!d) d = 1;
+    d = ((DWORD)us_per_int << 16) / d;
+    ticks_per_int = d >> 10;
+    tpi_frac = (BYTE)((WORD)d >> 2);
+}
 
 static FILE *F;
 static unsigned long sim_ints = 0;
@@ -50,6 +79,7 @@ static unsigned long n_seeks = 0, n_reads = 0;
 volatile BYTE int_cnt; BYTE cnt_last; BYTE im2_active;
 static void im2_on (void) { im2_active = 1; cnt_last = int_cnt; }
 static void im2_off (void) { im2_active = 0; }
+static void tick_guard (void) {}   /* DI-burst tick recovery: hardware-only concern */
 #define WAIT_VRETRACE (sim_ints++, int_cnt++)
 
 static WORD read (BYTE handle, BYTE *buf, WORD nbytes)
@@ -94,14 +124,17 @@ int main (int argc, char **argv)
     if (!cmp4b (buffer, (BYTE*)"MThd")) { fprintf (stderr, "no MThd\n"); return 1; }
     if (buffer[9] > 1) { fprintf (stderr, "unsupported format\n"); return 1; }
 
+    us_per_int = 20000;
     ppq = buffer[12]<<8 | buffer[13];
     if (buffer[12] & 0x80)
     {
         buffer[12] &= 0x7F;
-        ticks_per_int = PRECISION * buffer[12] * buffer[13] * 20;
+        ppq = buffer[12] * buffer[13];
+        us_per_quarter = 1000000;
     }
     else
-        ticks_per_int = PRECISION * 20 * ppq / 500;
+        us_per_quarter = 500000;
+    settempo ();
 
     fhandle = 0;
     playmidi1 (buffer[10] ? MAX_TRACKS : buffer[11]);

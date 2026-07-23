@@ -53,6 +53,13 @@ static void pout(z80 *z, uint8_t port, uint8_t v) {
         return;
     }
     if (port == 0xFD) midi_outs++;   /* AY / MIDI bit-bang activity */
+    if (port == 0xFE) {              /* ULA: bits 0-2 = border colour */
+        static int lastb = -1;
+        if ((v & 7) != lastb) {
+            lastb = v & 7;
+            fprintf(stderr, "[border] %d\n", lastb);
+        }
+    }
 }
 
 static uint16_t hl(z80 *z) { return (z->h << 8) | z->l; }

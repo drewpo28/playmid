@@ -17,27 +17,24 @@
  */
 
 /*
-Compilar con (SDCC 3.x):
-sdcc -mz80 --reserve-regs-iy --opt-code-size --max-allocs-per-node 100000 ^
---nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2dc0 playmid.c z80.lib -L "C:\Program Files\SDCC\lib\z80"
-makebin -s 65535 -p playmid.ihx playmid.bin
-dd if=playmid.bin of=PLAYMID bs=1 skip=8192
-
-Con SDCC 4.2 o superior, compilar con la convencion de llamada por defecto (NO usar --sdcccall 0:
+Compilar con SDCC 4.x, con la convencion de llamada por defecto (NO usar --sdcccall 0:
 z80.lib viene compilada con la convencion por registros y las rutinas de multiplicacion/division
 recibirian basura; las funciones con ensamblador incrustado ya van marcadas con __sdcccall(0)):
 sdcc -mz80 --reserve-regs-iy --opt-code-size --max-allocs-per-node 100000 \
---nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2dc0 playmid.c z80.lib -L /path/to/sdcc/lib/z80
+--nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2ea8 playmid.c z80.lib -L /path/to/sdcc/lib/z80
+makebin -s 65535 -p playmid.ihx playmid.bin
+dd if=playmid.bin of=PLAYMID bs=1 skip=8192
 
 OJO con --data-loc. Si el código de este programa crece, habría que mover --data-loc adecuadamente para que no se
 solapen codigo y datos. Comprobar en el .map que _CODE+codigo de librerias termina antes de --data-loc, y que
-DATA termina antes de 0x3000 (donde empieza el buffer).
+_HOME termina antes de 0x3000 (donde empieza el buffer). El presupuesto esta apurado al limite: parte de los
+escalares globales vive dentro del buffer (declaraciones __at mas abajo) para liberar sitio en 0x2000-0x2FFF.
 
 MAPA DE MEMORIA (DivMMC RAM, 0x2000-0x3FFF):
-  0x2000-0x2C2F : codigo + literales
-  0x2C30-0x2FFF : datos (variables globales, estado de pistas) + codigo de libreria (_HOME)
-  0x3000-0x33FF : buffer de 1KB: staging de salida, scratch de cabeceras y cachés
-                  de lectura repartidas entre las pistas
+  0x2000-0x2EA7 : codigo + literales
+  0x2EA8-0x2FFF : datos (variables globales, estado de pistas) + codigo de libreria (_HOME)
+  0x3000-0x33FF : buffer de 1KB: staging de salida, ISR y tabla IM2, staging L2,
+                  escalares globales y cachés de lectura repartidas entre las pistas
   0x3400-0x3FFF : NO TOCAR. Lanzadores de comandos como el LNF Browser guardan aqui su
                   propio estado; escribir en esta zona cuelga o resetea al volver.
   La pantalla tampoco se toca: usarla de caché provocaba un reset al salir cuando el
@@ -117,7 +114,7 @@ __sfr __banked __at (0xfd3b) ZXUNODATA;
 #define SEEK_CUR         1
 #define SEEK_BKCUR       2
 
-BYTE errno;
+// (errno lives in the buffer page: see the __at declarations below)
 
 // Esta precisión la he elegido suponiendo que ppq nunca será mayor en la práctica de 2048, para que no 
 // desborde en 32 bits al calcular el valor de ticks_per_int en un evento FF 03 58
@@ -126,13 +123,7 @@ BYTE errno;
 // variables globales en lugar de locales para agilizar su lectura, y no depender de direccionamiento indexado
 // que engordaría y enlentecería (más aún) el programa
 
-BYTE i, c;     // contadores de bucle, etc.
-BYTE param1;   // tipo de metaevento
-WORD ppq;                  // pulsos por negra, de la cabecera (cabe en 16 bits)
-DWORD ticks_per_int;       // ticks de reloj MIDI por interrupcion, escalado por PRECISION
 __at(0x3000) BYTE buffer[1024];  // Staging para la cabecera y los eventos MIDI salientes. No moverlo de aqui sin tocar SendMIDI
-WORD lbytes;             // longitud de metaeventos y sysex
-DWORD us_per_quarter;    // ultimo tempo leido con el metaevento Set Tempo
 
 // ---- Soporte para MIDI formato 1 (multipista) ----
 // Todo vive DENTRO del buffer de 1KB en 0x3000: los primeros 64 bytes son el staging
@@ -142,48 +133,146 @@ DWORD us_per_quarter;    // ultimo tempo leido con el metaevento Set Tempo
 // de la pagina DivMMC, y tocar la pantalla provoco resets al volver al lanzador.
 // Disposicion del buffer de 0x3000 durante la reproduccion:
 //   0x3000-0x302F  staging de salida (48 bytes; los sysex se trocean a 48)
-//   0x3030-0x303B  rutina de interrupcion IM2 (copiada aqui en tiempo de ejecucion)
-//   0x303C-0x30FF  staging de las recargas L2 (196 bytes por tanda)
+//   0x3030-0x303B  rutina de interrupcion IM2 (datos const cargados con el binario)
+//   0x303C-0x30BB  staging de las recargas L2 (128 bytes por paso)
+//   0x30BC-0x30FF  escalares globales (declaraciones __at mas abajo)
 //   0x3100-0x3201  tabla de vectores IM2 (257 bytes de 0x30 -> handler en 0x3030)
-//   0x3202-0x33FF  cachés de lectura L1 de las pistas
+//   0x3202-0x3365  cachés de lectura L1 de las pistas
+//   0x3366-0x33FF  more globals (see below)
 #define MAX_TRACKS   17                   // pista de tempo + 16 canales: el maximo de un format 1 tipico
-#define TCACHE_TOTAL 510                  // bytes de buffer disponibles para cachés L1
+#define TCACHE_TOTAL 356                  // bytes de buffer disponibles para cachés L1
 #define tcaches      (buffer+0x202)       // las cachés van tras la tabla de vectores IM2
 #define L2STAGE      (buffer+0x3C)        // staging de recargas L2 (hueco tras la ISR)
-#define L2STAGE_SIZE 196
+#define L2STAGE_SIZE 128                  // power of 2: keeps the ring fill position aligned
 
-BYTE fhandle;                    // handle del fichero, global para poder recargar cachés desde cualquier rutina
+// Per-track state, packed in one struct: set_curtrk/scan_tracks walk a single
+// pointer instead of indexing five separate arrays (each indexed DWORD access
+// costs an address computation on the Z80). 12 bytes, no padding.
+typedef struct
+{
+    DWORD off;                 // offset en el fichero de la proxima recarga de caché L1
+    DWORD l2end;               // file offset where the ring's valid data ends
+    WORD  bank;                // bank offset of the next L1 byte (ring read pointer)
+    BYTE  cpos;                // posicion de lectura dentro de la caché (tcsize <= 255)
+    BYTE  clen;                // bytes válidos en la caché
+} TRKST;
+TRKST tst[MAX_TRACKS];
 
-// ---- Caché L2 en los bancos de RAM del 128K ----
-// El acceso a la SD (F_SEEK con recorrido de la FAT + F_READ) cuesta milisegundos y
-// hecho una vez por cada recarga pequeña de caché se oye como micro-tirones. Por eso
-// cada pista tiene una ventana L2 en los bancos 1/3/4/6 (64KB en total, repartidos),
-// que se rellena desde la SD en tandas grandes y secuenciales (un solo seek por
-// ventana), y las recargas de la caché L1 del buffer pasan a ser copias de RAM.
-// OJO: esto sacrifica el RAM-disc de 128 BASIC. Requiere paginado disponible.
-// Mientras el nucleo de esxdos trabaja, pagina su propio banco sobre 0x2000-0x3FFF y
-// nuestra tabla de vectores IM2 desaparece: una interrupcion en modo IM2 en ese
-// momento saltaria a un vector basura. Prohibir las interrupciones del todo (DI)
-// tampoco vale: el nucleo puede necesitarlas y la maquina se quedaria colgada dentro
-// de la llamada. Solucion: desmontar POR COMPLETO nuestro modo IM2 (incluido I=0x3F)
-// alrededor de cada recarga L2, de forma que esxdos trabaje siempre en el estado
-// estandar de la maquina, identico al del reproductor original. Reconstruir la tabla
-// al volver cuesta ~1ms y las recargas L2 son raras (una por ventana de varios KB).
-void bankxfer (BYTE bank, WORD off, BYTE *p, WORD n, BYTE wr) STACKARGS;
-void bankmove (WORD woff, BYTE *p, WORD n, BYTE wr);
+// More globals squeezed into the buffer page (the 0x2000-0x2FFF code+data budget is
+// full). Everything here is engine or program state that the esxdos kernel never
+// touches; the page is always mapped while we run.
+__at (0x3366) DWORD dtmp;                  // settempo scratch (a stack frame costs more code)
+__at (0x336A) TRKST *curstate;             // slot of the active track (spares recomputing t*12)
+__at (0x336C) TRKST *pst;                  // walking pointer for scans over tst
+__at (0x336E) BYTE tracks;                 // numero de pistas MTrk encontradas (max MAX_TRACKS)
+__at (0x336F) BYTE curtrk;                 // pista que se está procesando ahora mismo
+__at (0x3370) BYTE wire_status;            // ultimo byte de estado enviado por el cable (0 = ninguno)
+__at (0x3371) BYTE trkn;                   // indice de pista del barrido (OJO: trk_event machaca la global i)
+__at (0x3372) BYTE fired;                  // a 1 si en este frame ha sonado algun evento
+__at (0x3378) TRKST cur;                   // estado de la pista activa espejado aqui: mas rapido
+                                           // que indexar tst en cada byte, y el cambio de pista
+                                           // es una sola copia de struct
+__at (0x3384) DWORD trk_next[MAX_TRACKS];  // tick absoluto (escalado por PRECISION) del proximo evento
+__at (0x33C8) BYTE errno;
+__at (0x33C9) BYTE fhandle;                // handle del fichero, global para recargar cachés desde cualquier rutina
+__at (0x33CA) BYTE i, c;                   // contadores de bucle, etc.
+__at (0x33CC) BYTE param1;                 // tipo de metaevento
+__at (0x33CD) BYTE l2_eof[MAX_TRACKS];     // a 1 si la ventana ya llega hasta el final del fichero
+__at (0x33DE) BYTE trk_status[MAX_TRACKS]; // running status propio de cada pista (imprescindible al mezclar)
+__at (0x33EF) BYTE trk_end[MAX_TRACKS];    // a 1 cuando la pista ha terminado (FF 2F o EOF)
 
-DWORD muldw (DWORD a, WORD b) STACKARGS;
+// Scalar globals kept in the unused tail of the L2 staging slot (0x30BC-0x30FF):
+// that region is always mapped while we run, and it does not eat into the
+// 0x2000-0x2FFF code+data budget, which is packed to the last byte.
+__at (0x30BC) WORD ppq;          // pulsos por negra, de la cabecera (cabe en 16 bits)
+__at (0x30BE) WORD lbytes;       // longitud de metaeventos y sysex
+__at (0x30C0) DWORD ticks_per_int;   // ticks de reloj MIDI por interrupcion, escalado por PRECISION
+__at (0x30C4) DWORD us_per_quarter;  // ultimo tempo leido con el metaevento Set Tempo
+__at (0x30C8) DWORD now;         // ticks transcurridos desde el principio (escalado por PRECISION)
+__at (0x30CC) WORD rem, remt;    // bytes restantes de ventana L2 (solo palabra baja: sobra)
+__at (0x30D0) DWORD *pnext;      // puntero para recorrer trk_next sin indexar
+__at (0x30D2) BYTE *rdptr;       // ventana de lectura de la pista activa:
+__at (0x30D4) BYTE *rdend;       // evita indexar arrays en cada byte
+__at (0x30D6) BYTE *cptr;        // puntero a la caché de curtrk
+__at (0x30D8) WORD tcsize;       // tamaño de la caché de cada pista (TCACHE_TOTAL/tracks)
+__at (0x30DA) WORD l2_area;      // bytes de banco reservados a cada pista (potencia de 2)
+__at (0x30DC) BYTE pick;         // rotating prefetch candidate (persists across frames)
+__at (0x30DE) BYTE tpi_frac;     // fractional ticks per frame, in 256ths of a PRECISION unit
+__at (0x30DF) BYTE tfrac;        // accumulator for tpi_frac (carries whole units into now)
+__at (0x30E2) WORD sent;         // MIDI bytes sent since the last accounted tick (see tick_guard)
+__at (0x30E4) WORD spsave;       // caller SP while bankmove runs on the scratch stack
+// 0x30E6-0x30F1: bankmove scratch stack (top at 0x30F2). While a foreign bank is
+// paged at 0xC000 the caller's stack may vanish from the map, so interrupts are
+// serviced with SP pointing here (everything the ISR and the EPROM's IM1 handler
+// touch lives in this page, which is always mapped).
+__at (0x30F4) WORD lmask;        // l2_area-1: ring offsets wrap by masking (l2_area is a power of 2)
+__at (0x30F6) WORD us_per_int;   // frame length in us, measured at startup (see playmidi)
+__at (0x30F8) WORD fillb;        // l2_fillstep scratch: absolute bank offset to write at
+__at (0x30FA) WORD xn;           // l2_fillstep/trk_refill scratch: byte count
+__at (0x30FC) BYTE sd_trk;       // track of the last SD read (0xFF: none): skips redundant seeks
+
+// ---- L2 cache in the 128K RAM banks ----
+// SD access (F_SEEK walking the FAT chain + F_READ) costs milliseconds, and done
+// once per small cache refill it is heard as micro-stutter. So each track owns an
+// L2 window in banks 1/3/4/6 (64KB total, shared out), managed as a RING: it is
+// refilled from the SD in small bounded steps (l2_fillstep, 128 bytes, usually
+// with no seek because a track's steps are sequential) slipped into event-less
+// frames, and L1 cache refills from it are plain RAM copies. All rings are filled
+// completely BEFORE the clock starts; after that a whole window is never reloaded
+// in one go: that used to stall the music for several frames in a row and was heard
+// as an audible glitch every time a window ran dry.
+// NOTE: this sacrifices the 128 BASIC RAM-disc. Working 128K paging is required.
+// While the esxdos kernel works it pages its own bank over 0x2000-0x3FFF and our
+// IM2 vector table vanishes from the map: an IM2 interrupt at that moment would
+// jump through a garbage vector. Disabling interrupts outright (DI) is no good
+// either: the kernel may need them and the machine would hang inside the call.
+// Solution: switch to IM1/I=0x3F around each SD access, so esxdos always runs in
+// the bone-stock machine state. The table is not corrupted (only unmapped), so the
+// switch is cheap; however, frames that elapse while our clock is dismounted are
+// lost, which is exactly why SD accesses during playback must be short steps, never
+// whole windows.
+void bankmove (WORD woff, BYTE *p, WORD n, BYTE wr) STACKARGS;
+
 void settempo (void);
-BYTE banknum (BYTE idx);
 // ---- Reloj por contador de interrupciones (mecanismo tomado de ZMP) ----
 // Contar HALTs pierde tiempo: mientras se procesa un evento o se envian bytes por el
 // MIDI pasan frames que el reloj no ve, y en los pasajes densos la musica se arrastra.
 // En su lugar instalamos un handler IM2 minusculo que incrementa un contador en CADA
 // interrupcion; el bucle de espera se pone al dia con todos los frames transcurridos
 // (y se salta los HALT sobrantes), igual que hace zx-midiplayer.
-volatile BYTE int_cnt;           // incrementado por la ISR de IM2
-BYTE cnt_last;                   // ultimo valor consumido por el reloj
-BYTE im2_active;                 // a 1 mientras nuestro modo IM2 esta instalado
+volatile __at (0x30FE) BYTE int_cnt;   // incrementado por la ISR de IM2 (0x30FE: la ISR const lo lleva cableado)
+__at (0x30FD) BYTE cnt_last;           // ultimo valor consumido por el reloj
+
+// La ISR y la tabla de vectores NO se construyen en tiempo de ejecucion: son datos
+// constantes en direcciones absolutas dentro del buffer, asi que llegan cargadas
+// con el propio binario (el comando punto ocupa 0x2000-0x3201) y no cuestan codigo.
+// El nucleo de esxdos desmapea esta pagina mientras trabaja pero no la corrompe.
+__at (0x3030) const BYTE im2_isr[12] = {
+    0xF5,                    // push af
+    0x3A, 0xFE, 0x30,        // ld a,(0x30FE)   ; int_cnt
+    0x3C,                    // inc a
+    0x32, 0xFE, 0x30,        // ld (0x30FE),a
+    0xF1,                    // pop af
+    0xFB,                    // ei
+    0xED, 0x4D               // reti
+};
+__at (0x3100) const BYTE im2_tab[258] = {   // cualquier byte del bus -> vector 0x3030
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,
+    0x30,0x30,0x30,0x30,0x30,0x30
+};
 void im2_on (void);
 void im2_off (void);
 
@@ -287,101 +376,113 @@ BYTE commandlinemode (char *p)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Multiplica un DWORD por un WORD (suma y desplazamiento clasicos). Evita arrastrar
-// __mullong (la rutina generica de 32x32 de la libreria ocupa 272 bytes) y compila
-// mucho mas compacto en ensamblador. Solo se usa al cambiar el tempo.
-DWORD muldw (DWORD a, WORD b) STACKARGS
+// Recomputes the tick rate from the current tempo, zx-midiplayer style: first the
+// integer us-per-MIDI-tick, then ticks-per-frame in 16.16 fixed point from the
+// measured frame length. The previous single division at PRECISION=64 truncated
+// hard for low-ppq files (ppq 24 at 60bpm: 30.72 -> 30, i.e. 2.3% slow — the exact
+// "tempo drags in some MIDIs" symptom, invisible in high-ppq files). Splitting off
+// a 10-bit fraction that the frame loop accumulates leaves only the us-per-tick
+// truncation, the same sub-0.1% ZMP has.
+void settempo (void)
+{
+    if (us_per_quarter && ppq)
+    {
+        dtmp = us_per_quarter / ppq;            // us per MIDI tick, like ZMP's tempo/ppqn
+        if (!dtmp)
+            dtmp = 1;
+        dtmp = ((DWORD)us_per_int << 16) / dtmp;   // ticks per frame, 16.16 fixed point
+        ticks_per_int = dtmp >> 10;             // integer part at PRECISION=64...
+        tpi_frac = (BYTE)((WORD)dtmp >> 2);     // ...plus a fraction in 256ths of a unit
+    }
+}
+
+// Measures the machine's frame duration: counts 35-T-state iterations across 2
+// frames (between int_cnt edges, with our IM2 clock already running) and returns
+// count*5, which is the frame length in us if the clock is an exact 3.50MHz
+// (35 T / 2 frames / 3.5 MHz = 5 us per iteration).
+WORD meas (void) STACKARGS
 {
     __asm
     push bc
     ld hl,#0
+    ld a,(#_int_cnt)
+    ld c,a
+mea_edge:
+    ld a,(#_int_cnt)    ;wait for an edge so the count starts aligned
+    cp c
+    jr z,mea_edge
+    add a,#2            ;target: 2 frames from now
+    ld c,a
+mea_loop:
+    inc hl              ;(6)
+    ld a,(#_int_cnt)    ;(13)
+    cp c                ;(4)
+    jr nz,mea_loop      ;(12)  -> 35 T-states per iteration
     ld d,h
-    ld e,l          ;DEHL = resultado = 0
-    ld c,8(ix)
-    ld b,9(ix)      ;BC = b
-mul_loop:
-    ld a,b
-    or c
-    jr z,mul_done
-    srl b
-    rr c            ;bit 0 de b pasa al carry
-    jr nc,mul_shift
-    ld a,l          ;DEHL += a (la copia de a vive en el frame, 4..7(ix))
-    add a,4(ix)
-    ld l,a
-    ld a,h
-    adc a,5(ix)
-    ld h,a
-    ld a,e
-    adc a,6(ix)
-    ld e,a
-    ld a,d
-    adc a,7(ix)
-    ld d,a
-mul_shift:
-    sla 4(ix)       ;a <<= 1
-    rl 5(ix)
-    rl 6(ix)
-    rl 7(ix)
-    jr mul_loop
-mul_done:
+    ld e,l              ;DE = count
+    add hl,hl           ;HL = count*2
+    add hl,hl           ;HL = count*4
+    add hl,de           ;HL = count*5 = us per frame at 3.50MHz
     pop bc
     __endasm;
 }
 
-// Recalcula ticks_per_int a partir del tempo actual.
-// ticks_per_int = PRECISION * 20000 * ppq / us_per_quarter, y PRECISION*20000 = 1280000
-void settempo (void)
+// A MIDI byte occupies the wire for ~371us and is sent with interrupts disabled:
+// an INT falling inside is lost forever (the Spectrum's /INT pulse lasts ~32
+// T-states and is not latched). In dense passages the send chain spans a whole
+// frame and the clock falls short: the music drags — the audible symptom. The
+// remedy is self-verifying: if >=64 bytes went out since the last accounted frame
+// (>23ms of wire time alone) and int_cnt STILL has not changed, the tick must have
+// fallen inside a DI burst, so it is credited by rewinding cnt_last. If the INT
+// instead landed in an EI gap, int_cnt already differs and nothing is credited.
+void tick_guard (void) __naked
 {
-    if (us_per_quarter)
-        ticks_per_int = muldw (1280000UL, ppq) / us_per_quarter;
+    __asm
+    ld hl,(#_sent)
+    ld de,#-64
+    add hl,de           ;carry set iff sent >= 64; HL = sent-64
+    jr c,tg_frame
+    ld hl,#0            ;less than a frame of wire time: just reset the counter
+    ld (#_sent),hl
+    ret
+tg_frame:
+    ld (#_sent),hl
+    ld a,(#_cnt_last)
+    ld hl,#_int_cnt
+    cp (hl)
+    ret nz              ;the tick was seen normally: nothing to credit
+    dec a
+    ld (#_cnt_last),a   ;tick eaten inside a DI burst: credit it
+    ret
+    __endasm;
 }
 
-// Numero de banco 128K para cada 16KB del fichero: 1, 3, 4, 6 (los libres con BASIC
-// quieto). OJO: JAMAS los bancos 5 (¡es la pantalla!), 2, 0 ni 7 (pantalla sombra).
-BYTE banknum (BYTE idx)
+// Enables the IM2 clock (I=0x31; the ISR and vector table are const data loaded
+// with the binary). This is a pure mode switch: cheap enough to wrap around every
+// esxdos call, and harmless before the scheduler runs (the ISR just ticks a counter).
+void im2_on (void) __naked
 {
-    return (idx << 1) | (idx < 2);   // 0,1,2,3 -> 1,3,4,6
-}
-
-// Instala el reloj IM2: construye la ISR en 0x3030 (dentro del buffer), rellena la
-// tabla de vectores en 0x3100 con 0x30 (cualquier byte del bus da vector 0x3030), y
-// activa IM2 con I=0x31. Todo vive en la pagina DivMMC, que esta siempre mapeada
-// mientras ejecutamos.
-void im2_on (void)
-{
-    BYTE *p;
-
-    p = buffer + 0x30;
-    *p++ = 0xF5;                                        // push af
-    *p++ = 0x3A; *(WORD *)p = (WORD)&int_cnt; p += 2;   // ld a,(int_cnt)
-    *p++ = 0x3C;                                        // inc a
-    *p++ = 0x32; *(WORD *)p = (WORD)&int_cnt; p += 2;   // ld (int_cnt),a
-    *p++ = 0xF1;                                        // pop af
-    *p++ = 0xFB;                                        // ei
-    *p++ = 0xED; *p = 0x4D;                             // reti
-    for (p = buffer + 0x100; p != buffer + 0x202; p++)
-        *p = 0x30;
-    im2_active = 1;
     __asm
     di
     ld a,#0x31
     ld i,a
     im 2
     ei
+    ret
     __endasm;
 }
 
-// Restaura el modo de interrupciones estandar del Spectrum (IM1, I=0x3F)
-void im2_off (void)
+// Restaura el modo de interrupciones estandar del Spectrum (IM1, I=0x3F).
+// Tambien es inocuo si ese ya era el modo activo.
+void im2_off (void) __naked
 {
-    im2_active = 0;
     __asm
     di
     im 1
     ld a,#0x3F
     ld i,a
     ei
+    ret
     __endasm;
 }
 
@@ -396,34 +497,10 @@ void im2_off (void)
    Los eventos de tempo (FF 51) se aplican globalmente, lo que con el merge
    por ticks da el resultado correcto sin más esfuerzo. */
 
-BYTE tracks;                   // numero de pistas MTrk encontradas (max MAX_TRACKS)
-BYTE curtrk;                   // pista que se está procesando ahora mismo
-// Estado de la pista activa espejado en globales: acceder a arrays DWORD indexados
-// en cada byte/recarga es caro en el Z80, asi que set_curtrk carga aqui el estado y
-// lo guarda de vuelta al cambiar de pista.
-DWORD cur_off;                 // offset en el fichero de la proxima recarga L1
-DWORD cur_l2end;               // offset de fichero donde termina la ventana L2
-WORD cur_l2bank;               // offset en los bancos del proximo byte L1
-BYTE *cptr;                    // puntero a la caché de curtrk
-WORD tcsize;                   // tamaño de la caché de cada pista (TCACHE_TOTAL/tracks)
-DWORD trk_off[MAX_TRACKS];     // offset en el fichero de la proxima recarga de caché L1
-DWORD l2_end[MAX_TRACKS];      // offset de fichero donde termina la ventana L2 de la pista
-WORD l2_bank[MAX_TRACKS];      // offset dentro de los bancos del proximo byte L1 a copiar
-BYTE l2_eof[MAX_TRACKS];       // a 1 si la ventana ya llega hasta el final del fichero
-WORD l2_area;                  // bytes de banco reservados a cada pista
-DWORD trk_next[MAX_TRACKS];    // tick absoluto (escalado por PRECISION) del proximo evento
-BYTE trk_status[MAX_TRACKS];   // running status propio de cada pista (imprescindible al mezclar)
-BYTE trk_end[MAX_TRACKS];      // a 1 cuando la pista ha terminado (FF 2F o EOF)
-BYTE trk_cpos[MAX_TRACKS];     // posicion de lectura dentro de la caché (tcsize <= 255)
-BYTE trk_clen[MAX_TRACKS];     // bytes válidos en la caché
-DWORD now;                     // ticks transcurridos desde el principio (escalado por PRECISION)
-BYTE wire_status;              // ultimo byte de estado enviado por el cable (0 = ninguno), para running status de salida
-DWORD *pnext;                  // puntero para recorrer trk_next sin indexar
-BYTE trkn;                     // indice de pista del barrido (OJO: trk_event machaca la global i)
-BYTE fired;                    // a 1 si en este frame ha sonado algun evento
-BYTE pick;                     // pista elegida para la precarga en frames vacios
-WORD rem, remt;                // bytes restantes de ventana L2 (solo palabra baja: sobra)
-BYTE *rdptr, *rdend;           // ventana de lectura de la pista activa: evita indexar arrays en cada byte
+// (All engine state — TRKST/tst/cur, tracks/curtrk/trkn/fired/wire_status,
+// trk_next/l2_eof/trk_status/trk_end and the scalar working set — is declared
+// next to the buffer, outside the 0x2000-0x2FFF budget: see the declarations
+// above the engine section. Only tst itself still lives in the DATA segment.)
 
 // OJO: el contador FRAMES (23672) NO sirve de reloj: mientras se ejecuta un comando
 // punto, el manejador de 0x38 de la EPROM de esxdos no encadena con la ISR de la ROM
@@ -438,78 +515,86 @@ void set_curtrk (BYTE t)
         return;
     if (curtrk != 0xFF)
     {
-        trk_cpos[curtrk] = rdptr - cptr;
-        trk_clen[curtrk] = rdend - cptr;
-        trk_off[curtrk] = cur_off;
-        l2_end[curtrk] = cur_l2end;
-        l2_bank[curtrk] = cur_l2bank;
+        cur.cpos = rdptr - cptr;
+        cur.clen = rdend - cptr;
+        *curstate = cur;
     }
     curtrk = t;
+    curstate = tst + t;
+    cur = *curstate;
     cptr = tcaches + (WORD)t * tcsize;
-    rdptr = cptr + trk_cpos[t];
-    rdend = cptr + trk_clen[t];
-    cur_off = trk_off[t];
-    cur_l2end = l2_end[t];
-    cur_l2bank = l2_bank[t];
+    rdptr = cptr + cur.cpos;
+    rdend = cptr + cur.clen;
 }
 
-// Rellena desde la SD la ventana L2 (en los bancos) de la pista activa, con un solo
-// seek y lecturas secuenciales grandes a traves del staging L2.
-void l2_refill (void)
+// One refill step of the active track's L2 ring: reads at most L2STAGE_SIZE bytes
+// from the SD and appends them to the ring. Bounded to a few ms, so the SD cost is
+// spread across many frames instead of stalling the music with whole-window reloads
+// (frames that esxdos spends with our IM2 clock dismounted are lost, and a whole
+// window is several frames in a row: it was heard as a glitch). The seek (a
+// FAT-chain walk, the expensive part) is skipped when the last SD read was for this
+// same track (sd_trk): reads of one track are sequential. l2_area is a power of
+// two, so all ring arithmetic is masking with lmask — no multiplies, no carries.
+// Scratch lives in globals: much cheaper than ix-indexed locals on the Z80.
+void l2_fillstep (void)
 {
-    WORD base, got, chunk, n;
-    BYTE was;
-
-    base = (WORD)curtrk * l2_area;
-    got = 0;
-    was = im2_active;
-    if (was)
-        im2_off ();        // esxdos trabaja en el estado estandar de interrupciones
-    seekset (fhandle, cur_off);
-    while (got < l2_area)
+    xn = 0;            // callers poll xn to see whether the step landed
+    if (l2_eof[curtrk])
+        return;
+    remt = *(WORD *)&cur.l2end - *(WORD *)&cur.off;   // valid bytes in the ring (< 64K: low words suffice)
+    if (remt > (WORD)(lmask - (L2STAGE_SIZE - 1)))
+        return;                                       // no room for a whole step
+    // Write position: the fill pointer only ever advances in steps of 128, so it
+    // stays aligned and a step never straddles the window end. Crossing into the
+    // next window shows up in the bits above lmask; the 16-bit wrap of the last
+    // window (base 0x8000, l2_area 0x8000) folds correctly through the subtract.
+    fillb = cur.bank + remt;
+    if ((fillb ^ cur.bank) & ~lmask)
+        fillb -= l2_area;
+    im2_off ();        // esxdos must run in the bone-stock interrupt state
+    if (sd_trk != curtrk)
     {
-        chunk = l2_area - got;
-        if (chunk > L2STAGE_SIZE)
-            chunk = L2STAGE_SIZE;
-        n = read (fhandle, L2STAGE, chunk);
-        if (n == 0xFFFF)
-            n = 0;
-        if (n)
-        {
-            bankmove (base + got, L2STAGE, n, 1);
-            got += n;
-        }
-        if (n < chunk)
-            break;                        // EOF
+        seekset (fhandle, cur.l2end);
+        sd_trk = curtrk;
     }
-    if (was)
-        im2_on ();
-    cur_l2bank = base;
-    cur_l2end = cur_off + got;
-    l2_eof[curtrk] = (got < l2_area);   // la ventana toca EOF: no hay nada mas que precargar
+    xn = read (fhandle, L2STAGE, L2STAGE_SIZE);
+    if (xn == 0xFFFF)
+        xn = 0;
+    if (xn)
+    {
+        bankmove (fillb, L2STAGE, xn, 1);
+        cur.l2end += xn;
+    }
+    if (xn < L2STAGE_SIZE)
+        l2_eof[curtrk] = 1;    // EOF: nothing left to prefetch for this track
+    im2_on ();
 }
 
-// Recarga la caché L1 de la pista activa desde su ventana L2 (copia de RAM). Si la
-// ventana esta agotada, se rellena antes desde la SD. Sin datos -> fin de pista.
+// Refills the active track's L1 cache from its L2 ring (a RAM copy). If the ring
+// is dry (prefetching could not keep up), a single bounded step is read from the
+// SD and we move on. No data at all -> end of track.
 void trk_refill (void)
 {
-    WORD n;
-
-    if (cur_off >= cur_l2end)
-        l2_refill ();
-    n = (WORD)(cur_l2end - cur_off);
-    if (n > tcsize)
-        n = tcsize;
-    if (n == 0)
+    xn = *(WORD *)&cur.l2end - *(WORD *)&cur.off;
+    if (xn == 0)
+        l2_fillstep ();    // ring dry: borrow one bounded step; xn = bytes it read
+    if (xn > tcsize)
+        xn = tcsize;
+    rem = l2_area - (cur.bank & lmask);               // contiguous run up to the window end
+    if (xn > rem)
+        xn = rem;
+    if (xn == 0)
         trk_end[curtrk] = 1;
     else
     {
-        bankmove (cur_l2bank, cptr, n, 0);
-        cur_l2bank += n;
-        cur_off += n;
+        bankmove (cur.bank, cptr, xn, 0);
+        cur.bank += xn;
+        if (!(cur.bank & lmask))                      // hit the window end: wrap to its base
+            cur.bank -= l2_area;
+        cur.off += xn;
     }
     rdptr = cptr;
-    rdend = cptr + n;
+    rdend = cptr + xn;
 }
 
 // Lee y consume el siguiente byte de la pista activa
@@ -621,32 +706,45 @@ void trk_event (void)
     SendMIDI (buffer, n);
 }
 
-// Frame sin eventos: precarga por adelantado la ventana L2 mas gastada, para que
-// las recargas de la SD caigan en los huecos de la musica y no encima de los
-// pasajes (las ventanas de todas las pistas se llenan a la vez al principio y se
-// agotan tambien mas o menos a la vez). El resto de ventana cabe en 16 bits.
+// One prefetch step for the most depleted L2 ring, so the SD cost lands in the
+// quiet gaps of the music instead of on top of dense passages. Remaining-byte
+// counts fit in 16 bits.
 void l2_prefetch (void)
 {
-    rem = tcsize << 1;             // umbral: menos de dos recargas L1 restantes
-    pick = 0xFF;
-    trk_off[curtrk] = cur_off;     // sincronizamos los espejos para poder comparar
-    l2_end[curtrk] = cur_l2end;
-    pnext = l2_end;
-    for (trkn = 0; trkn < tracks; trkn++, pnext++)
+    // Burst behaviour: keep topping up the track of the last SD read while it has
+    // room — its steps are sequential, so they need no seek. Only when that ring is
+    // full (or its track is dead) consider ONE rotating candidate per frame, and
+    // start a new burst only for a ring drained below HALF: an esxdos seek walks
+    // the whole FAT chain and costs real milliseconds, so SD work must happen in
+    // few long sequential bursts, not round-robin pokes (those lost enough clock
+    // frames to audibly drag the tempo).
+    // (sd_trk is always valid here: the startup prefill reads every track once.
+    // A track that ended must not be topped up — its ring would swallow the next
+    // track's file region. An EOF ring is cheaper to let fillstep reject.)
+    if (!trk_end[sd_trk])
     {
-        if (trk_end[trkn] || l2_eof[trkn])
-            continue;
-        remt = *(WORD *)pnext - *(WORD *)(trk_off + trkn);
-        if (remt < rem)
-        {
-            rem = remt;
-            pick = trkn;
-        }
+        set_curtrk (sd_trk);
+        l2_fillstep ();
+        if (xn)
+            return;                // the burst goes on next idle frame
     }
-    if (pick != 0xFF)
+    if (++pick >= tracks)          // pick/pst rotate together, one candidate per frame
+    {
+        pick = 0;
+        pst = tst;
+    }
+    else
+        pst++;
+    if (trk_end[pick] || l2_eof[pick])
+        return;
+    // curtrk's tst slot may be stale (its live state sits in cur between switches).
+    // Harmless: at worst its burst starts a frame late, or set_curtrk degrades into
+    // its t==curtrk shortcut plus a fillstep that reads the fresh mirrors.
+    remt = *(WORD *)&pst->l2end - *(WORD *)&pst->off;
+    if (remt < (l2_area >> 1))     // low watermark
     {
         set_curtrk (pick);
-        l2_refill ();
+        l2_fillstep ();
     }
 }
 
@@ -661,6 +759,8 @@ void scan_tracks (BYTE ntrk)
 
     tracks = 0;
     fpos = 14;
+    pst = tst;
+    lbytes = 0;        // running ring base (lbytes is free until playback starts)
     while (tracks < ntrk && tracks < MAX_TRACKS)
     {
         seekset (fhandle, fpos);
@@ -675,13 +775,16 @@ void scan_tracks (BYTE ntrk)
         fpos += 8;
         if (((WORD *)buffer)[0] == 0x544D && ((WORD *)buffer)[1] == 0x6B72)   // "MTrk"
         {
-            trk_off[tracks] = fpos;
-            l2_end[tracks] = fpos;         // ventana L2 vacia: el primer uso la rellena
+            pst->off = fpos;
+            pst->l2end = fpos;             // ring vacio: el primer uso lo rellena
+            pst->bank = lbytes;            // each ring starts empty at its base
+            pst->cpos = 0;
+            pst->clen = 0;
+            pst++;
+            lbytes += l2_area;
             l2_eof[tracks] = 0;
             trk_status[tracks] = 0;
             trk_end[tracks] = 0;
-            trk_cpos[tracks] = 0;
-            trk_clen[tracks] = 0;
             tracks++;
         }
         fpos += len;    // chunks desconocidos se saltan sin contarlos
@@ -692,24 +795,41 @@ BYTE playmidi1 (BYTE ntrk)
 {
     BYTE best;
 
+    if (ntrk > MAX_TRACKS)
+        ntrk = MAX_TRACKS;
+
+    // L2 ring per track: the largest power of two such that all the tracks fit in
+    // the 64KB of banks (a power of two makes every ring wrap a masking operation).
+    // Sized from the header's track count, so scan_tracks can hand out ring bases.
+    l2_area = 0x8000;                      // 1-2 tracks: two 32KB halves
+    for (i = 2; i < ntrk; i <<= 1)
+        l2_area >>= 1;
+    lmask = l2_area - 1;
+    sd_trk = 0xFF;
+
     scan_tracks (ntrk);
     if (tracks == 0)
         return 1;       // el que llama imprime el error
 
-    // Cuantas menos pistas, mas caché por pista (tope: 255, trk_cpos/clen son BYTE)
+    // Cuantas menos pistas, mas caché por pista (tope: 255, cpos/clen son BYTE)
     tcsize = (WORD)TCACHE_TOTAL / (WORD)tracks;
     if (tcsize > 255)
         tcsize = 255;
-    l2_area = 0xFFFF / tracks;             // reparto de los 64KB de bancos entre pistas
 
     // Leemos el primer delta de cada pista para inicializar su next_tick.
     // Una pista terminada se marca con next_tick = 0xFFFFFFFF (centinela): asi el
-    // planificador no necesita consultar trk_end.
+    // planificador no necesita consultar trk_end. De paso se llena del todo el ring
+    // de cada pista: la espera cae aqui, cuando aun no suena nada (un seek por
+    // pista y lecturas secuenciales), y con los ficheros que caben en los bancos
+    // la SD no se vuelve a tocar durante la musica.
     curtrk = 0xFF;
     best = 0;                                  // contador de pistas vivas
     for (trkn = 0; trkn < tracks; trkn++)
     {
         set_curtrk (trkn);
+        do
+            l2_fillstep ();
+        while (xn);                            // hasta ring lleno o EOF
         trk_next[trkn] = trk_varlen() << 6;    // <<6 == * PRECISION
         if (trk_end[trkn])
             trk_next[trkn] = 0xFFFFFFFF;
@@ -725,7 +845,10 @@ BYTE playmidi1 (BYTE ntrk)
     // pausa. Nada de buscar el tick minimo ni de reordenar: en los acordes densos
     // el coste por evento se queda en el parseo y el cable, no en el planificador.
     now = 0;
+    tfrac = 0;
     wire_status = 0;
+    pick = 0;          // rotating prefetch candidate; pst mirrors it
+    pst = tst;
     im2_on ();         // desde aqui el reloj lo lleva la ISR
     cnt_last = int_cnt;
     while (1)
@@ -734,6 +857,8 @@ BYTE playmidi1 (BYTE ntrk)
         if ((SEMIFILA8 & 0x1) == 0)
             return 0;
 
+        tick_guard ();  // recover ticks eaten by DI send bursts (see its comment)
+
         // Un frame por vuelta: si la ISR no ha contado ninguno pendiente, dormimos.
         // Si vamos con retraso (un pasaje denso tardo mas de un frame), se procesan
         // vueltas seguidas sin dormir hasta ponerse al dia.
@@ -741,6 +866,9 @@ BYTE playmidi1 (BYTE ntrk)
             WAIT_VRETRACE;
         cnt_last++;
         now += ticks_per_int;
+        tfrac += tpi_frac;         // accumulate the fractional ticks-per-frame...
+        if (tfrac < tpi_frac)      // ...8-bit wrap = a whole PRECISION unit: carry it
+            now++;
 
         fired = 0;
         pnext = trk_next;
@@ -765,7 +893,7 @@ BYTE playmidi1 (BYTE ntrk)
             while (*pnext <= now);
         }
 
-        // Frame sin eventos: aprovechamos el hueco para precargar la SD
+        // Event-less frame: the perfect slot for one prefetch step
         if (!fired)
             l2_prefetch ();
     }
@@ -793,6 +921,23 @@ void playmidi (BYTE f)
         return;
     }
 
+    // Calibrate the machine's true frame duration, zx-midiplayer style: count
+    // 35-T-state iterations across 2 frames. Assuming a fixed 20ms made a Pentagon
+    // (71680 T, 20.48ms per frame) play 2.4% slow. At an exact 3.5MHz the count
+    // times 5 already IS the frame length in us (48K, Pentagon, Scorpion); the
+    // 128K family (3.5469MHz crystal, 70908 T = 19.99ms) shows up as an inflated
+    // count in a window of its own and gets snapped to the exact value.
+    im2_on ();
+    rem = meas () - 19000;              // us per frame minus 19000, at an exact 3.50MHz clock
+    im2_off ();
+    if (rem > 2000)
+        rem = 1000;                     // wild reading (turbo, NTSC...): assume 50Hz as before
+    else if (rem > 1100 && rem < 1420)
+        rem = 992;                      // 128K/+2/+3: reading inflated by the 1.3% faster crystal
+    us_per_int = rem + 19000;
+    sent = 0;
+    tpi_frac = 0;                       // settempo sets it for real right below
+
     // Leemos el PPQ (partes por quarter, o el numero de ticks del reloj de MIDI que dura una negra
     ppq = ((WORD)buffer[12]<<8) | buffer[13];
 
@@ -802,26 +947,26 @@ void playmidi (BYTE f)
     //seconds_per_tick = µs_per_tick / 1.000.000
     //seconds = ticks * seconds_per_tick
 
-    // calculamos el numero de ticks MIDI que hay en una interrupción del Spectrum (20ms)
-    // Este cálculo es distinto dependiendo del bit 7 del byte 12 de la cabecera
+    // Numero de ticks MIDI por interrupcion; el calculo depende del bit 7 del byte
+    // 12 de la cabecera. Ambos casos se modelan con settempo: el caso SMPTE
+    // (fps*subframes ticks por segundo) equivale a una "negra" de un segundo.
     if (buffer[12]&0x80)
     {
         buffer[12] &= 0x7F;
-        ticks_per_int = muldw ((DWORD)(buffer[12] * buffer[13]), 20 * PRECISION);
+        ppq = (WORD)buffer[12] * buffer[13];
+        us_per_quarter = 1000000;
     }
     else  // habitualmente los MIDs lo calculan de esta otra forma, es decir, habitualmente el bit 7 del byte 12 es 0.
-    {
         us_per_quarter = 500000;
-        settempo ();
-    }
+    settempo ();
 
     fhandle = f;
-    im2_active = 0;   // sin crt0 las globales arrancan con basura: inicializar explicitamente
 
-    // Borde verde mientras suena la musica. OJO: nada de imprimir por RST 16 en el
-    // camino de exito: bajo lanzadores como el LNF Browser el canal de pantalla de
-    // BASIC no es valido y la maquina se resetea.
-    ULA = 4;
+    // Green border for format 0, yellow for format 1, so the two can be told apart
+    // at a glance. NOTE: never print via RST 16 on the success path: under launchers
+    // like the LNF Browser the BASIC screen channel is invalid and printing resets
+    // the machine.
+    ULA = buffer[9] ? 6 : 4;
 
     res = playmidi1 (buffer[10] ? MAX_TRACKS : buffer[11]);   // numero de pistas de la cabecera (topado a MAX_TRACKS)
     im2_off ();     // restauramos IM1 e I=0x3F antes de volver al sistema
@@ -840,6 +985,8 @@ void playmidi (BYTE f)
 void SendMIDI (BYTE *ev, BYTE lev) STACKARGS
 {
   BYTE d;
+
+  sent += lev;   // wire-time bookkeeping for tick_guard
 
   // Si estamos en el ZXUNO, esta operación debe hacerse a la velocidad estándar (3.5 MHz)
   ZXUNOADDR = 0xb;
@@ -1092,69 +1239,113 @@ void close (BYTE handle) STACKARGS
     __endasm;
 }
 
-// Transfiere n bytes (n>0) entre RAM normal y un banco de 128K paginado en 0xC000.
-// wr=0: banco->p (lectura), wr=1: p->banco (escritura). Se ejecuta con interrupciones
-// deshabilitadas y sin usar la pila mientras el banco ajeno esta paginado, porque en
-// 0xC000-0xFFFF puede vivir la pila de BASIC. El puerto 0x7FFD es de solo escritura,
-// asi que el valor a restaurar sale de su copia en BANKM (23388).
-void bankxfer (BYTE bank, WORD off, BYTE *p, WORD n, BYTE wr) STACKARGS
+// Copies n bytes between the preloaded file image in the banks (offset woff) and
+// p, splitting the copy at the 16KB bank boundaries. Bank number for each 16KB of
+// file: 1, 3, 4, 6 (the ones free while BASIC sits still) — NEVER 5 (the screen!),
+// 2, 0 or 7 (shadow screen). wr=0: bank->p (read), wr=1: p->bank (write). Port
+// 0x7FFD is write-only, so the value to restore comes from its copy at BANKM.
+// Interrupts stay ENABLED throughout: this used to hide behind DI, but every
+// L1-refill ldir is ~1ms of blindness and INTs falling inside were lost (the
+// Spectrum's /INT pulse lasts ~32 T-states), slowly dragging the clock. Instead SP
+// is switched to a scratch stack inside the DivMMC page: the caller's stack may
+// live in 0xC000-0xFFFF (it vanishes when a foreign bank is paged there), but the
+// scratch one is always mapped, so an INT mid-copy is serviced safely.
+void bankmove (WORD woff, BYTE *p, WORD n, BYTE wr) STACKARGS
 {
     __asm
     push bc
     push de
-    ;OJO: la pila (y el frame IX) de BASIC pueden estar en 0xC000-0xFFFF, es decir,
-    ;dentro de la ventana que vamos a paginar. Hay que leer TODOS los parametros y
-    ;dejar la pila en paz ANTES de tocar el puerto, y no usarla hasta restaurarlo.
-    ld a,6(ix)
-    or #0xC0
-    ld h,a
-    ld l,5(ix)      ;HL = 0xC000 + off (lado banco)
-    ld e,7(ix)
-    ld d,8(ix)      ;DE = p (lado RAM normal)
-    ld a,11(ix)     ;wr?
-    or a
-    jr z,bkx_rd
-    ex de,hl        ;escritura: origen p, destino banco
-bkx_rd:
-    ld c,9(ix)
-    ld b,10(ix)     ;BC = n
+    ;NOTE: the caller stack -- and with it the IX parameter frame -- may live in
+    ;0xC000-0xFFFF, inside the window being paged. All (ix) accesses therefore
+    ;happen only while the ORIGINAL paging is active (before the out / after the
+    ;restore); while the foreign bank is in, only the scratch stack is used.
+    ld (#_spsave),sp
+    ld sp,#0x30F2   ;scratch stack in the DivMMC page: INTs stay serviceable
+bkm_loop:
+    ld a,8(ix)
+    or 9(ix)        ;n == 0? -> done
+    jp z,bkm_done
+    ld a,5(ix)      ;bank number from woff bits 14-15: 0,1,2,3 -> 1,3,4,6
+    rlca
+    rlca
+    and #0x03
+    ld b,a          ;B = 16KB index
+    add a,a
+    ld c,a          ;C = index*2
+    ld a,b
+    cp #2
+    ld a,c
+    jr nc,bkm_bnk   ;index >= 2 -> bank = index*2
+    inc a           ;index < 2  -> bank = index*2+1
+bkm_bnk:
+    ld d,a
     ld a,(#23388)   ;BANKM
     and #0xF8
-    or 4(ix)        ;banco pedido en los bits 0-2
-    di
+    or d
+    push af         ;paging value for this chunk
+    ld e,4(ix)
+    ld a,5(ix)
+    and #0x3F
+    ld d,a          ;DE = woff & 0x3FFF (offset inside the bank)
+    ld hl,#0x4000
+    or a
+    sbc hl,de       ;HL = room up to the bank boundary
+    ld c,8(ix)
+    ld b,9(ix)      ;BC = n
+    or a
+    sbc hl,bc
+    add hl,bc
+    jr c,bkm_chk    ;room < n -> chunk = room (HL)
+    ld h,b
+    ld l,c          ;chunk = n
+bkm_chk:
+    ld a,c          ;n -= chunk
+    sub l
+    ld 8(ix),a
+    ld a,b
+    sbc a,h
+    ld 9(ix),a
+    ld b,h
+    ld c,l          ;BC = chunk
+    set 7,d
+    set 6,d         ;DE = 0xC000 + offset (bank side)
+    ld l,6(ix)
+    ld h,7(ix)      ;HL = p (normal-RAM side)
+    ld a,l          ;p += chunk
+    add a,c
+    ld 6(ix),a
+    ld a,h
+    adc a,b
+    ld 7(ix),a
+    ld a,4(ix)      ;woff += chunk
+    add a,c
+    ld 4(ix),a
+    ld a,5(ix)
+    adc a,b
+    ld 5(ix),a
+    ld a,10(ix)     ;wr? p->bank : bank->p
+    or a
+    jr nz,bkm_dir
+    ex de,hl        ;read: source is the bank side
+bkm_dir:
+    pop af          ;paging value
     exx
-    push bc         ;salvamos BC alt (la pila aun es la normal: no hemos paginado)
+    push bc         ;save alt BC on the scratch stack
     ld bc,#0x7ffd
-    out (c),a       ;banco ajeno paginado: desde aqui ni pila ni frame
+    out (c),a       ;foreign bank paged in: caller stack/frame untouchable
     exx
-    ldir            ;la copia no usa la pila
+    ldir
     ld a,(#23388)
     exx
-    out (c),a       ;restauramos el paginado original (BC alt sigue siendo 0x7ffd)
-    pop bc          ;recuperamos BC alt (la pila vuelve a ser visible)
+    out (c),a       ;restore the original paging (alt BC still holds 0x7ffd)
+    pop bc
     exx
-    ei
+    jp bkm_loop
+bkm_done:
+    ld sp,(#_spsave)
     pop de
     pop bc
     __endasm;
-}
-
-// Copia n bytes entre el fichero precargado (offset woff) y p, partiendo la copia
-// en las fronteras de 16KB entre bancos.
-void bankmove (WORD woff, BYTE *p, WORD n, BYTE wr)
-{
-    WORD chunk;
-
-    while (n)
-    {
-        chunk = 0x4000 - (woff & 0x3FFF);
-        if (chunk > n)
-            chunk = n;
-        bankxfer (banknum((BYTE)(woff >> 14)), woff & 0x3FFF, p, chunk, wr);
-        woff += chunk;
-        p += chunk;
-        n -= chunk;
-    }
 }
 
 // Posiciona el puntero de lectura del fichero en un offset absoluto desde el principio.

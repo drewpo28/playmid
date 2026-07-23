@@ -18,7 +18,17 @@ def simulate(fname):
         pos += 8 + ln
     tracks = tracks[:17]                     # MAX_TRACKS
 
-    ticks_per_int = [PRECISION * 20 * ppq // 500]
+    def tpi_calc(us):
+        # mirror of the engine's settempo: 16.16 ticks per frame, split into an
+        # integer part at PRECISION=64 plus an 8-bit fraction (1/256ths of a unit)
+        d = us // ppq
+        if d == 0:
+            d = 1
+        t = (20000 << 16) // d
+        return [t >> 10, (t >> 2) & 0xFF]
+
+    ticks_per_int = tpi_calc(500000)         # [integer, fraction/1024]
+    tfrac = [0]
     now = 0          # scaled
     ints = 0
     idx = [0]*len(tracks)
@@ -43,7 +53,7 @@ def simulate(fname):
             if payload[0] == 0x51 and len(payload) == 4:
                 us = int.from_bytes(payload[1:4], 'big')
                 if us:
-                    ticks_per_int[0] = PRECISION * 20000 * ppq // us
+                    ticks_per_int[:] = tpi_calc(us)
 
     # frame-sweep scheduler, mirror of the engine (zx-midiplayer style):
     # once per frame visit every track in order; a due track drains all its
@@ -54,6 +64,10 @@ def simulate(fname):
     while live > 0:
         ints += 1
         now += ticks_per_int[0]
+        tfrac[0] += ticks_per_int[1]
+        if tfrac[0] >= 256:                  # 8-bit wrap carries a PRECISION unit, like the engine
+            tfrac[0] -= 256
+            now += 1
         for ti, tr in enumerate(tracks):
             if idx[ti] >= len(tr):
                 continue
