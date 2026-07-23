@@ -172,7 +172,7 @@ BYTE fhandle;                    // handle del fichero, global para poder recarg
 void bankxfer (BYTE bank, WORD off, BYTE *p, WORD n, BYTE wr) STACKARGS;
 void bankmove (WORD woff, BYTE *p, WORD n, BYTE wr);
 
-DWORD muldw (DWORD a, WORD b);
+DWORD muldw (DWORD a, WORD b) STACKARGS;
 void settempo (void);
 BYTE banknum (BYTE idx);
 // ---- Reloj por contador de interrupciones (mecanismo tomado de ZMP) ----
@@ -287,20 +287,46 @@ BYTE commandlinemode (char *p)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// Multiplica un DWORD por un WORD. Evita arrastrar __mullong (la rutina generica
-// de 32x32 de la libreria ocupa 272 bytes y esto solo se usa al cambiar el tempo).
-DWORD muldw (DWORD a, WORD b)
+// Multiplica un DWORD por un WORD (suma y desplazamiento clasicos). Evita arrastrar
+// __mullong (la rutina generica de 32x32 de la libreria ocupa 272 bytes) y compila
+// mucho mas compacto en ensamblador. Solo se usa al cambiar el tempo.
+DWORD muldw (DWORD a, WORD b) STACKARGS
 {
-    DWORD r = 0;
-
-    while (b)
-    {
-        if (b & 1)
-            r += a;
-        a += a;
-        b >>= 1;
-    }
-    return r;
+    __asm
+    push bc
+    ld hl,#0
+    ld d,h
+    ld e,l          ;DEHL = resultado = 0
+    ld c,8(ix)
+    ld b,9(ix)      ;BC = b
+mul_loop:
+    ld a,b
+    or c
+    jr z,mul_done
+    srl b
+    rr c            ;bit 0 de b pasa al carry
+    jr nc,mul_shift
+    ld a,l          ;DEHL += a (la copia de a vive en el frame, 4..7(ix))
+    add a,4(ix)
+    ld l,a
+    ld a,h
+    adc a,5(ix)
+    ld h,a
+    ld a,e
+    adc a,6(ix)
+    ld e,a
+    ld a,d
+    adc a,7(ix)
+    ld d,a
+mul_shift:
+    sla 4(ix)       ;a <<= 1
+    rl 5(ix)
+    rl 6(ix)
+    rl 7(ix)
+    jr mul_loop
+mul_done:
+    pop bc
+    __endasm;
 }
 
 // Recalcula ticks_per_int a partir del tempo actual.
@@ -383,16 +409,20 @@ WORD tcsize;                   // tamaño de la caché de cada pista (TCACHE_TOT
 DWORD trk_off[MAX_TRACKS];     // offset en el fichero de la proxima recarga de caché L1
 DWORD l2_end[MAX_TRACKS];      // offset de fichero donde termina la ventana L2 de la pista
 WORD l2_bank[MAX_TRACKS];      // offset dentro de los bancos del proximo byte L1 a copiar
+BYTE l2_eof[MAX_TRACKS];       // a 1 si la ventana ya llega hasta el final del fichero
 WORD l2_area;                  // bytes de banco reservados a cada pista
 DWORD trk_next[MAX_TRACKS];    // tick absoluto (escalado por PRECISION) del proximo evento
 BYTE trk_status[MAX_TRACKS];   // running status propio de cada pista (imprescindible al mezclar)
 BYTE trk_end[MAX_TRACKS];      // a 1 cuando la pista ha terminado (FF 2F o EOF)
-WORD trk_cpos[MAX_TRACKS];     // posicion de lectura dentro de la caché
-WORD trk_clen[MAX_TRACKS];     // bytes válidos en la caché
+BYTE trk_cpos[MAX_TRACKS];     // posicion de lectura dentro de la caché (tcsize <= 255)
+BYTE trk_clen[MAX_TRACKS];     // bytes válidos en la caché
 DWORD now;                     // ticks transcurridos desde el principio (escalado por PRECISION)
 BYTE wire_status;              // ultimo byte de estado enviado por el cable (0 = ninguno), para running status de salida
 DWORD *pnext;                  // puntero para recorrer trk_next sin indexar
 BYTE trkn;                     // indice de pista del barrido (OJO: trk_event machaca la global i)
+BYTE fired;                    // a 1 si en este frame ha sonado algun evento
+BYTE pick;                     // pista elegida para la precarga en frames vacios
+WORD rem, remt;                // bytes restantes de ventana L2 (solo palabra baja: sobra)
 BYTE *rdptr, *rdend;           // ventana de lectura de la pista activa: evita indexar arrays en cada byte
 
 // OJO: el contador FRAMES (23672) NO sirve de reloj: mientras se ejecuta un comando
@@ -456,6 +486,7 @@ void l2_refill (void)
         im2_on ();
     cur_l2bank = base;
     cur_l2end = cur_off + got;
+    l2_eof[curtrk] = (got < l2_area);   // la ventana toca EOF: no hay nada mas que precargar
 }
 
 // Recarga la caché L1 de la pista activa desde su ventana L2 (copia de RAM). Si la
@@ -590,16 +621,44 @@ void trk_event (void)
     SendMIDI (buffer, n);
 }
 
+// Frame sin eventos: precarga por adelantado la ventana L2 mas gastada, para que
+// las recargas de la SD caigan en los huecos de la musica y no encima de los
+// pasajes (las ventanas de todas las pistas se llenan a la vez al principio y se
+// agotan tambien mas o menos a la vez). El resto de ventana cabe en 16 bits.
+void l2_prefetch (void)
+{
+    rem = tcsize << 1;             // umbral: menos de dos recargas L1 restantes
+    pick = 0xFF;
+    trk_off[curtrk] = cur_off;     // sincronizamos los espejos para poder comparar
+    l2_end[curtrk] = cur_l2end;
+    pnext = l2_end;
+    for (trkn = 0; trkn < tracks; trkn++, pnext++)
+    {
+        if (trk_end[trkn] || l2_eof[trkn])
+            continue;
+        remt = *(WORD *)pnext - *(WORD *)(trk_off + trkn);
+        if (remt < rem)
+        {
+            rem = remt;
+            pick = trkn;
+        }
+    }
+    if (pick != 0xFF)
+    {
+        set_curtrk (pick);
+        l2_refill ();
+    }
+}
+
 // Bucle principal de reproduccion.
 // ntrk es el numero de pistas que declara la cabecera MThd.
 // Devuelve 0 si se ha reproducido, 1 si no se encontro ninguna pista MTrk.
-BYTE playmidi1 (BYTE ntrk)
+// Recorre los chunks del fichero construyendo la tabla de offsets de comienzo de
+// cada pista. La longitud de cada chunk está en su cabecera.
+void scan_tracks (BYTE ntrk)
 {
-    BYTE best;
     DWORD len, fpos;
 
-    // Recorremos los chunks del fichero construyendo la tabla de offsets de
-    // comienzo de cada pista. La longitud de cada chunk está en su cabecera.
     tracks = 0;
     fpos = 14;
     while (tracks < ntrk && tracks < MAX_TRACKS)
@@ -618,6 +677,7 @@ BYTE playmidi1 (BYTE ntrk)
         {
             trk_off[tracks] = fpos;
             l2_end[tracks] = fpos;         // ventana L2 vacia: el primer uso la rellena
+            l2_eof[tracks] = 0;
             trk_status[tracks] = 0;
             trk_end[tracks] = 0;
             trk_cpos[tracks] = 0;
@@ -626,11 +686,20 @@ BYTE playmidi1 (BYTE ntrk)
         }
         fpos += len;    // chunks desconocidos se saltan sin contarlos
     }
-    if (tracks == 0)
-        return 1;       // el que llama imprime el error (aqui los atributos estan apagados)
+}
 
-    // Cuantas menos pistas, mas caché por pista y menos seeks durante la reproduccion
+BYTE playmidi1 (BYTE ntrk)
+{
+    BYTE best;
+
+    scan_tracks (ntrk);
+    if (tracks == 0)
+        return 1;       // el que llama imprime el error
+
+    // Cuantas menos pistas, mas caché por pista (tope: 255, trk_cpos/clen son BYTE)
     tcsize = (WORD)TCACHE_TOTAL / (WORD)tracks;
+    if (tcsize > 255)
+        tcsize = 255;
     l2_area = 0xFFFF / tracks;             // reparto de los 64KB de bancos entre pistas
 
     // Leemos el primer delta de cada pista para inicializar su next_tick.
@@ -673,11 +742,13 @@ BYTE playmidi1 (BYTE ntrk)
         cnt_last++;
         now += ticks_per_int;
 
+        fired = 0;
         pnext = trk_next;
         for (trkn = 0; trkn < tracks; trkn++, pnext++)
         {
             if (*pnext > now)          // aun no le toca (el centinela de pista
                 continue;              // terminada, 0xFFFFFFFF, nunca "toca")
+            fired = 1;
             set_curtrk (trkn);
             do
             {
@@ -693,6 +764,10 @@ BYTE playmidi1 (BYTE ntrk)
             }
             while (*pnext <= now);
         }
+
+        // Frame sin eventos: aprovechamos el hueco para precargar la SD
+        if (!fired)
+            l2_prefetch ();
     }
 }
 
