@@ -137,10 +137,10 @@ __at(0x3000) BYTE buffer[1024];  // Staging para la cabecera y los eventos MIDI 
 //   0x303C-0x30BB  staging de las recargas L2 (128 bytes por paso)
 //   0x30BC-0x30FF  escalares globales (declaraciones __at mas abajo)
 //   0x3100-0x3201  tabla de vectores IM2 (257 bytes de 0x30 -> handler en 0x3030)
-//   0x3202-0x3365  cachés de lectura L1 de las pistas
-//   0x3366-0x33FF  more globals (see below)
+//   0x3202-0x3343  cachés de lectura L1 de las pistas
+//   0x3344-0x33FF  more globals (see below)
 #define MAX_TRACKS   17                   // pista de tempo + 16 canales: el maximo de un format 1 tipico
-#define TCACHE_TOTAL 356                  // bytes de buffer disponibles para cachés L1
+#define TCACHE_TOTAL 322                  // bytes de buffer disponibles para cachés L1
 #define tcaches      (buffer+0x202)       // las cachés van tras la tabla de vectores IM2
 #define L2STAGE      (buffer+0x3C)        // staging de recargas L2 (hueco tras la ISR)
 #define L2STAGE_SIZE 128                  // power of 2: keeps the ring fill position aligned
@@ -161,7 +161,15 @@ TRKST tst[MAX_TRACKS];
 // More globals squeezed into the buffer page (the 0x2000-0x2FFF code+data budget is
 // full). Everything here is engine or program state that the esxdos kernel never
 // touches; the page is always mapped while we run.
-__at (0x3366) DWORD dtmp;                  // settempo scratch (a stack frame costs more code)
+__at (0x3344) WORD trk_steps[MAX_TRACKS];  // 128-byte fill steps left before the track's chunk is
+                                           // fully buffered: fetching past its end would only pull
+                                           // the NEXT track's bytes into the ring (junk that FF 2F
+                                           // never lets be consumed), wasting ever-deeper seeks
+                                           // right at the piece's end
+__at (0x3366) DWORD sdpos;                 // actual file pointer position: lets seeknext hop
+                                           // FORWARD relative to it instead of paying an absolute
+                                           // seek (esxdos walks the FAT chain from the file start,
+                                           // so absolute seeks get dearer as playback advances)
 __at (0x336A) TRKST *curstate;             // slot of the active track (spares recomputing t*12)
 __at (0x336C) TRKST *pst;                  // walking pointer for scans over tst
 __at (0x336E) BYTE tracks;                 // numero de pistas MTrk encontradas (max MAX_TRACKS)
@@ -177,7 +185,8 @@ __at (0x33C8) BYTE errno;
 __at (0x33C9) BYTE fhandle;                // handle del fichero, global para recargar cachés desde cualquier rutina
 __at (0x33CA) BYTE i, c;                   // contadores de bucle, etc.
 __at (0x33CC) BYTE param1;                 // tipo de metaevento
-__at (0x33CD) BYTE l2_eof[MAX_TRACKS];     // a 1 si la ventana ya llega hasta el final del fichero
+__at (0x33CD) BYTE l2_eof[MAX_TRACKS];     // a 1 cuando ya no queda nada que precargar para la pista
+                                           // (su chunk entero esta en el ring, o EOF del fichero)
 __at (0x33DE) BYTE trk_status[MAX_TRACKS]; // running status propio de cada pista (imprescindible al mezclar)
 __at (0x33EF) BYTE trk_end[MAX_TRACKS];    // a 1 cuando la pista ha terminado (FF 2F o EOF)
 
@@ -196,16 +205,34 @@ __at (0x30D4) BYTE *rdend;       // evita indexar arrays en cada byte
 __at (0x30D6) BYTE *cptr;        // puntero a la caché de curtrk
 __at (0x30D8) WORD tcsize;       // tamaño de la caché de cada pista (TCACHE_TOTAL/tracks)
 __at (0x30DA) WORD l2_area;      // bytes de banco reservados a cada pista (potencia de 2)
-__at (0x30DC) BYTE pick;         // rotating prefetch candidate (persists across frames)
+__at (0x30DC) BYTE evst;         // trk_event scratch: resolved status byte for this event
+__at (0x30DD) BYTE best;        // playmidi1: live-track countdown, must survive trk_event()
+                                 // calls (which clobber param1 for its own metaevent scratch)
 __at (0x30DE) BYTE tpi_frac;     // fractional ticks per frame, in 256ths of a PRECISION unit
 __at (0x30DF) BYTE tfrac;        // accumulator for tpi_frac (carries whole units into now)
-__at (0x30E2) WORD sent;         // MIDI bytes sent since the last accounted tick (see tick_guard)
+__at (0x30E0) BYTE txlen;        // bytes queued in txbuf, waiting for the frame flush
+__at (0x30E1) BYTE txsnap;       // int_cnt snapshot taken when a flush starts (see tx_flush)
+__at (0x30E2) BYTE txlast;       // wire bytes sent since this frame's halt (saturating):
+                                 // ~0.39ms each, it estimates how deep into the frame we
+                                 // are — the SD prefetch step is skipped when the phase
+                                 // is no longer provably far from the next /INT
+__at (0x30E3) BYTE hltf;         // 1 if this scheduler pass started with a real halt
+                                 // (frame phase known), 0 on catch-up passes
 __at (0x30E4) WORD spsave;       // caller SP while bankmove runs on the scratch stack
 // 0x30E6-0x30F1: bankmove scratch stack (top at 0x30F2). While a foreign bank is
 // paged at 0xC000 the caller's stack may vanish from the map, so interrupts are
 // serviced with SP pointing here (everything the ISR and the EPROM's IM1 handler
 // touch lives in this page, which is always mapped).
 __at (0x30F4) WORD lmask;        // l2_area-1: ring offsets wrap by masking (l2_area is a power of 2)
+// TX queue: events are not sent the moment they are parsed but queued here and
+// flushed in one burst right after the frame's event sweep, i.e. always near the
+// START of a frame, when the next /INT is a whole frame away (zx-midiplayer does
+// the same). Lives in the padding hole between the end of _CODE and _DATA at
+// 0x2EB0 — after any code change, check in the .map that _CODE still ends below
+// TXBUF_BASE.
+#define TXBUF_BASE 0x2E60
+#define TXBUF_CAP  80            // <= 0x2EB0 - TXBUF_BASE; >= 48 (a sysex chunk) + a channel event
+__at (TXBUF_BASE) BYTE txbuf[TXBUF_CAP];
 __at (0x30F6) WORD us_per_int;   // frame length in us, measured at startup (see playmidi)
 __at (0x30F8) WORD fillb;        // l2_fillstep scratch: absolute bank offset to write at
 __at (0x30FA) WORD xn;           // l2_fillstep/trk_refill scratch: byte count
@@ -292,7 +319,7 @@ void print16bhex (WORD n);
 BYTE open (char *filename, BYTE mode) STACKARGS;
 void close (BYTE handle) STACKARGS;
 WORD read (BYTE handle, BYTE *buffer, WORD nbytes) STACKARGS;
-void seekset (BYTE handle, DWORD offset) STACKARGS;
+void seeknext (void) __naked;
 
 /* --------------------------------------------------------------------------------- */
 /* --------------------------------------------------------------------------------- */
@@ -301,6 +328,7 @@ void getfilename (char *p, char *fname);
 void playmidi (BYTE f);
 void SendMIDI (BYTE *ev, BYTE lev) STACKARGS;
 void SendMIDIByte (void) __naked;
+void tx_flush (void) __naked;
 
 // Rutina inicial. Debe ser el primer código que se encuentre en el fichero. Esta inicialización
 // está pensada para ser usada con ficheros .command de ESXDOS.
@@ -336,6 +364,7 @@ BYTE main (char *p) STACKARGS
   // Dejamos el puerto MIDI inactivo
   AYREGSELECT = 0x0e;
   AYREGWRITE = 0xfe;
+  txlen = 0;         // the TX queue starts empty (playmidi may never run)
 
   if (!p)
      return 0;
@@ -353,6 +382,7 @@ BYTE main (char *p) STACKARGS
       buffer[0] = 0xB0 | i;
       SendMIDI (buffer, 5);
   }
+  tx_flush ();      // SendMIDI only queues: drain whatever is still waiting
 
   return res;
 }
@@ -383,22 +413,87 @@ BYTE commandlinemode (char *p)
 // "tempo drags in some MIDIs" symptom, invisible in high-ppq files). Splitting off
 // a 10-bit fraction that the frame loop accumulates leaves only the us-per-tick
 // truncation, the same sub-0.1% ZMP has.
+// C shape of this routine (kept as the host-harness mock; SDCC compiles it 60%
+// fatter than the asm below, and the byte budget is packed to the last byte):
+//   d = 2 * us_per_quarter / ppq;                us per MIDI tick, double scale:
+//                                                like ZMP's tempo/ppqn, but one
+//                                                extra bit (plain truncation made
+//                                                high-ppq files up to +0.16% fast)
+//   if (!d) d = 1;
+//   d = ((DWORD)us_per_int << 17) / d;           ticks per frame, 16.16 fixed point
+//   ticks_per_int = d >> 10;                     integer part at PRECISION=64...
+//   tpi_frac = (BYTE)((WORD)d >> 2);             ...plus a fraction in 256ths
 void settempo (void)
 {
-    if (us_per_quarter && ppq)
-    {
-        // us per MIDI tick at double scale, like ZMP's tempo/ppqn but with one
-        // extra bit: plain integer truncation biased high-ppq files audibly fast
-        // (500000/960 -> 520 was +0.16% of tempo; the extra bit halves that)
-        dtmp = us_per_quarter;
-        dtmp += dtmp;
-        dtmp /= ppq;
-        if (!dtmp)
-            dtmp = 1;
-        dtmp = ((DWORD)us_per_int << 17) / dtmp;   // ticks per frame, 16.16 fixed point
-        ticks_per_int = dtmp >> 10;             // integer part at PRECISION=64...
-        tpi_frac = (BYTE)((WORD)dtmp >> 2);     // ...plus a fraction in 256ths of a unit
-    }
+    __asm
+    push bc
+    ld hl,(#_us_per_quarter)
+    ld a,h
+    or a,l
+    ld de,(#_us_per_quarter + 2)
+    or a,e
+    or a,d
+    jr z,st_out          ;tempo 0: keep the previous rate
+    ld hl,(#_ppq)
+    ld a,h
+    or a,l
+    jr z,st_out          ;ppq 0: broken header, keep the previous rate
+    ld bc,#0
+    push bc              ;divisor = ppq (32 bits: high word 0, low word ppq)
+    push hl
+    ld hl,(#_us_per_quarter)
+    add hl,hl            ;dividend = 2*us_per_quarter in DE(low) HL(high)
+    ex de,hl
+    ld hl,(#_us_per_quarter + 2)
+    adc hl,hl
+    call __divulong      ;DEHL = 2*upq / ppq = us per tick, double scale
+    pop bc
+    pop bc
+    ld a,d
+    or a,e
+    or a,h
+    or a,l
+    jr nz,st_dok
+    inc de               ;degenerate tempo: avoid dividing by zero below
+st_dok:
+    push hl              ;divisor = us per tick (high word, then low)
+    push de
+    ld hl,(#_us_per_int)
+    add hl,hl            ;dividend = us_per_int << 17: HL(high) = upi*2, DE(low) = 0
+    ld de,#0
+    call __divulong      ;DEHL = ticks per frame, 16.16 fixed point
+    pop bc
+    pop bc
+    ld a,d               ;ticks_per_int = DEHL >> 10 (as >>8, then >>2 in place)
+    ld (#_ticks_per_int + 0),a
+    ld a,l
+    ld (#_ticks_per_int + 1),a
+    ld a,h
+    ld (#_ticks_per_int + 2),a
+    xor a,a
+    ld (#_ticks_per_int + 3),a
+    ld b,#2
+st_shift:
+    ld hl,#_ticks_per_int + 2
+    srl (hl)
+    dec hl
+    rr (hl)
+    dec hl
+    rr (hl)
+    djnz st_shift
+    ld a,d               ;tpi_frac = bits 2-9 of the 16.16 fraction word (DE)
+    rrca
+    rrca
+    and a,#0xC0
+    ld b,a
+    ld a,e
+    srl a
+    srl a
+    or a,b
+    ld (#_tpi_frac),a
+st_out:
+    pop bc
+    __endasm;
 }
 
 // Measures the machine's frame duration: counts 35-T-state iterations across 2
@@ -435,32 +530,88 @@ mea_loop:
     __endasm;
 }
 
-// A MIDI byte occupies the wire for ~371us and is sent with interrupts disabled:
-// an INT falling inside is lost forever (the Spectrum's /INT pulse lasts ~32
-// T-states and is not latched). In dense passages the send chain spans a whole
-// frame and the clock falls short: the music drags — the audible symptom. The
-// remedy is self-verifying: if >=64 bytes went out since the last accounted frame
-// (>23ms of wire time alone) and int_cnt STILL has not changed, the tick must have
-// fallen inside a DI burst, so it is credited by rewinding cnt_last. If the INT
-// instead landed in an EI gap, int_cnt already differs and nothing is credited.
-void tick_guard (void) __naked
+// Sends the whole TX queue over the wire and accounts for any frame interrupt
+// that the burst provably swallowed. A MIDI byte occupies the wire for ~371us and
+// is bit-banged with interrupts disabled (an ISR would corrupt the bit timing);
+// the Spectrum's /INT pulse lasts only ~32 T-states and is not latched, so an INT
+// falling wholly inside a byte's DI window is lost forever — and every lost frame
+// delays the whole song by 20ms. Two defenses combine here:
+//  - the queue is flushed right after the event sweep, i.e. near the START of a
+//    frame, so a typical burst is over long before the next /INT is due;
+//  - a burst of >= 56 bytes occupies the wire for longer than one whole frame
+//    (56 * ~382us > 21ms > any Spectrum frame), so at least floor(txlen/56)
+//    interrupts MUST have struck during the flush; whatever int_cnt did not see
+//    of that lower bound was eaten inside DI and is credited back to the clock.
+//    (The bound is per-burst and phase-independent, so it can never over-credit;
+//    the old 64-byte guard credited at most 1 tick and only when int_cnt had not
+//    moved at all, which lost a dozen frames on the initial controller burst.)
+void tx_flush (void) __naked
 {
     __asm
-    ld hl,(#_sent)
-    ld de,#-64
-    add hl,de           ;carry set iff sent >= 64; HL = sent-64
-    jr c,tg_frame
-    ld hl,#0            ;less than a frame of wire time: just reset the counter
-    ld (#_sent),hl
-    ret
-tg_frame:
-    ld (#_sent),hl
+    ld a,(#_txlen)
+    or a,a
+    ret z
+    push bc
+    push de
+    ld a,(#_int_cnt)
+    ld (#_txsnap),a          ;interrupts seen from here on are "during the flush"
+    ld a,#0x0b               ;ZXUNO: bit-bang timing needs the standard 3.5MHz
+    ld bc,#0xFC3B            ;ZXUNOADDR
+    out (c),a
+    ld bc,#0xFD3B            ;ZXUNODATA
+    in a,(c)
+    push af                  ;previous speed, restored after the burst
+    and a,#0x3F
+    out (c),a
+    ld hl,#_txbuf
+    ld a,(#_txlen)
+    ld b,a
+txf_loop:
+    ld a,(hl)
+    push bc
+    push hl
+    di
+    call _SendMIDIByte
+    ei
+    pop hl
+    pop bc
+    inc hl
+    djnz txf_loop
+    pop af                   ;ZXUNO: restore whatever speed was set
+    ld bc,#0xFD3B
+    out (c),a
+    ld a,(#_txlen)           ;b = floor(txlen/56): frames provably spanned
+    ld b,#0
+txf_div:
+    sub a,#56
+    jr c,txf_divdone
+    inc b
+    jr txf_div
+txf_divdone:
+    ld a,(#_txlast)          ;txlast += txlen, saturating at 255: frame-phase estimate
+    ld hl,#_txlen
+    add a,(hl)
+    jr nc,txf_nosat
+    ld a,#0xFF
+txf_nosat:
+    ld (#_txlast),a
+    xor a,a
+    ld (#_txlen),a
+    ld a,(#_int_cnt)
+    ld hl,#_txsnap
+    sub a,(hl)               ;a = interrupts int_cnt actually saw during the flush
+    ld c,a
+    ld a,b
+    sub a,c                  ;eaten = guaranteed - seen
+    jr c,txf_out
+    jr z,txf_out
+    ld b,a
     ld a,(#_cnt_last)
-    ld hl,#_int_cnt
-    cp (hl)
-    ret nz              ;the tick was seen normally: nothing to credit
-    dec a
-    ld (#_cnt_last),a   ;tick eaten inside a DI burst: credit it
+    sub a,b
+    ld (#_cnt_last),a        ;credit the eaten ticks back
+txf_out:
+    pop de
+    pop bc
     ret
     __endasm;
 }
@@ -516,23 +667,112 @@ void im2_off (void) __naked
 // nosotros mismos con la ISR de IM2 (y el teclado se lee de los puertos, no de LASTK).
 
 // Selecciona la pista activa: guarda la ventana de lectura y el estado de la anterior
-// y carga los de la nueva en las globales espejo
-void set_curtrk (BYTE t)
+// y carga los de la nueva en las globales espejo. Hand asm (STACKARGS, matching
+// bankmove/seeknext): this is the busiest call in the engine (every track switch),
+// and t*tcsize is done as a 5-iteration shift-add instead of a call to the
+// library's generic 16x16 __mulint -- cheaper in both code and cycles for a
+// multiplier bounded to MAX_TRACKS-1 (5 bits).
+void set_curtrk (BYTE t) STACKARGS
 {
-    if (t == curtrk)
-        return;
-    if (curtrk != 0xFF)
-    {
-        cur.cpos = rdptr - cptr;
-        cur.clen = rdend - cptr;
-        *curstate = cur;
-    }
-    curtrk = t;
-    curstate = tst + t;
-    cur = *curstate;
-    cptr = tcaches + (WORD)t * tcsize;
-    rdptr = cptr + cur.cpos;
-    rdend = cptr + cur.clen;
+    __asm
+    ld a,4(ix)
+    ld hl,#_curtrk
+    cp a,(hl)
+    jr z,sc_exit            ; t == curtrk: nothing to do
+
+    ld a,(hl)                ; old curtrk
+    inc a
+    jr z,sc_noflush          ; old curtrk was 0xFF: skip the flush
+
+    ld hl,(#_rdptr)
+    ld de,(#_cptr)
+    or a
+    sbc hl,de
+    ld a,l
+    ld (#_cur+10),a          ; cur.cpos = rdptr - cptr
+    ld hl,(#_rdend)
+    ld de,(#_cptr)
+    or a
+    sbc hl,de
+    ld a,l
+    ld (#_cur+11),a          ; cur.clen = rdend - cptr
+    ld hl,#_cur
+    ld de,(#_curstate)
+    ld bc,#12
+    ldir                     ; *curstate = cur
+
+sc_noflush:
+    ld a,4(ix)
+    ld (#_curtrk),a
+    ld h,#0                  ; curstate = tst + t*12
+    ld l,a
+    add hl,hl
+    add hl,hl
+    ld d,h
+    ld e,l
+    add hl,hl
+    add hl,de
+    ld de,#_tst
+    add hl,de
+    ld (#_curstate),hl
+    ld de,#_cur
+    ld bc,#12
+    ldir                     ; cur = *curstate
+
+    ld a,4(ix)               ; cptr = tcaches + t*tcsize (shift-add, t < 32)
+    ld hl,#0
+    ld de,(#_tcsize)
+    ld b,#5
+sc_mul:
+    rrca
+    jr nc,sc_mul_skip
+    add hl,de
+sc_mul_skip:
+    sla e
+    rl d
+    djnz sc_mul
+    ld de,#(_buffer+514)     ; tcaches
+    add hl,de
+    ld (#_cptr),hl
+
+    ld a,(#_cur+10)          ; rdptr = cptr + cur.cpos
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld (#_rdptr),hl
+    ld hl,(#_cptr)           ; rdend = cptr + cur.clen
+    ld a,(#_cur+11)
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld (#_rdend),hl
+sc_exit:
+    __endasm;
+}
+
+// Valid bytes waiting in a track's L2 ring (< 64K: low words suffice). Hand asm:
+// this was factored out of l2_fillstep/trk_refill/l2_prefetch (each used to
+// inline its own copy of the subtraction), and is now called from all three.
+WORD trk_remaining (TRKST *p) STACKARGS
+{
+    __asm
+    ld l,4(ix)
+    ld h,5(ix)               ; HL = p
+    push hl
+    ld bc,#4
+    add hl,bc                ; HL = &p->l2end
+    ld e,(hl)
+    inc hl
+    ld d,(hl)                ; DE = p->l2end (low word)
+    pop hl                   ; HL = p
+    ld c,(hl)
+    inc hl
+    ld b,(hl)                ; BC = p->off (low word)
+    ld h,d
+    ld l,e
+    or a
+    sbc hl,bc                ; HL = l2end - off
+    __endasm;
 }
 
 // One refill step of the active track's L2 ring: reads at most L2STAGE_SIZE bytes
@@ -544,215 +784,712 @@ void set_curtrk (BYTE t)
 // same track (sd_trk): reads of one track are sequential. l2_area is a power of
 // two, so all ring arithmetic is masking with lmask — no multiplies, no carries.
 // Scratch lives in globals: much cheaper than ix-indexed locals on the Z80.
-void l2_fillstep (void)
+void l2_fillstep (void) __naked
 {
-    xn = 0;            // callers poll xn to see whether the step landed
-    if (l2_eof[curtrk])
-        return;
-    remt = *(WORD *)&cur.l2end - *(WORD *)&cur.off;   // valid bytes in the ring (< 64K: low words suffice)
-    if (remt > (WORD)(lmask - (L2STAGE_SIZE - 1)))
-        return;                                       // no room for a whole step
-    // Write position: the fill pointer only ever advances in steps of 128, so it
-    // stays aligned and a step never straddles the window end. Crossing into the
-    // next window shows up in the bits above lmask; the 16-bit wrap of the last
-    // window (base 0x8000, l2_area 0x8000) folds correctly through the subtract.
-    fillb = cur.bank + remt;
-    if ((fillb ^ cur.bank) & ~lmask)
-        fillb -= l2_area;
-    im2_off ();        // esxdos must run in the bone-stock interrupt state
-    if (sd_trk != curtrk)
-    {
-        seekset (fhandle, cur.l2end);
-        sd_trk = curtrk;
-    }
-    xn = read (fhandle, L2STAGE, L2STAGE_SIZE);
-    if (xn == 0xFFFF)
-        xn = 0;
-    if (xn)
-    {
-        bankmove (fillb, L2STAGE, xn, 1);
-        cur.l2end += xn;
-    }
-    if (xn < L2STAGE_SIZE)
-        l2_eof[curtrk] = 1;    // EOF: nothing left to prefetch for this track
-    im2_on ();
+    __asm
+    xor a,a
+    ld (#_xn),a
+    ld (#_xn+1),a           ; xn = 0
+    ld a,(#_curtrk)
+    ld hl,#_l2_eof
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld a,(hl)
+    or a,a
+    ret nz                  ; l2_eof[curtrk]: nothing to do
+
+    ld hl,#_cur             ; trk_remaining is STACKARGS: push the pointer, don't
+    push hl                 ; pass it in a register
+    call _trk_remaining
+    pop de                  ; caller cleans up; result stays in HL
+    ld (#_remt),hl
+
+    ld hl,(#_lmask)
+    ld de,#-127             ; -(L2STAGE_SIZE-1)
+    add hl,de
+    ex de,hl                ; de = lmask-127 (threshold)
+    ld hl,(#_remt)
+    or a
+    sbc hl,de               ; hl = remt - threshold
+    jr c,fls_room_ok        ; remt < threshold: room for a step
+    ld a,h
+    or l
+    jr z,fls_room_ok        ; remt == threshold: exactly enough room
+    ret                     ; remt > threshold: no room for a whole step
+fls_room_ok:
+    ld hl,(#_cur+8)         ; cur.bank
+    ld de,(#_remt)
+    add hl,de               ; fillb (tentative) = cur.bank + remt
+    ld (#_fillb),hl
+    ld de,(#_cur+8)
+    ld a,h
+    xor d
+    ld d,a
+    ld a,l
+    xor e
+    ld e,a                  ; de = fillb ^ cur.bank
+    ld hl,(#_lmask)
+    ld a,h
+    cpl
+    and d
+    ld d,a
+    ld a,l
+    cpl
+    and e
+    ld e,a                  ; de = (fillb^cur.bank) & ~lmask
+    ld a,d
+    or e
+    jr z,fls_noadjust
+    ld hl,(#_fillb)
+    ld de,(#_l2_area)
+    or a
+    sbc hl,de
+    ld (#_fillb),hl
+fls_noadjust:
+    call _im2_off           ; esxdos must run in the bone-stock interrupt state
+    ld a,(#_sd_trk)
+    ld hl,#_curtrk
+    cp a,(hl)
+    jr z,fls_noseek
+    call _seeknext          ; to cur.l2end: a cheap forward hop from sdpos when possible
+    ld a,(#_curtrk)
+    ld (#_sd_trk),a
+fls_noseek:
+    ld hl,#0x0080           ; xn = read(fhandle, L2STAGE, L2STAGE_SIZE)
+    push hl
+    ld hl,#(_buffer+60)
+    push hl
+    ld a,(#_fhandle)
+    push af
+    inc sp
+    call _read
+    pop af
+    pop af
+    inc sp
+    ld (#_xn),hl
+    call _im2_on            ; esxdos is done: remount the clock BEFORE the ring
+                            ; bankmove (it is interrupt-safe), not after — every
+                            ; us of this window loses any /INT that falls in it
+    ld hl,(#_xn)
+    ld a,h                  ; if (xn==0xFFFF) xn=0
+    and l
+    inc a
+    jr nz,fls_xnok
+    xor a,a
+    ld (#_xn),a
+    ld (#_xn+1),a
+fls_xnok:
+    ld hl,(#_xn)
+    ld a,h
+    or l
+    jr z,fls_noxn
+    ld a,#1                 ; bankmove(fillb, L2STAGE, xn, 1)
+    push af
+    inc sp
+    ld hl,(#_xn)
+    push hl
+    ld hl,#(_buffer+60)
+    push hl
+    ld hl,(#_fillb)
+    push hl
+    call _bankmove
+    pop af
+    pop af
+    pop af
+    inc sp
+    ld hl,(#_cur+4)         ; cur.l2end += xn (32-bit: propagate the carry)
+    ld de,(#_xn)
+    add hl,de
+    ld (#_cur+4),hl
+    jr nc,fls_l2end_done
+    ld hl,(#_cur+6)
+    inc hl
+    ld (#_cur+6),hl
+fls_l2end_done:
+    ld hl,(#_cur+4)         ; sdpos = cur.l2end
+    ld (#_sdpos),hl
+    ld hl,(#_cur+6)
+    ld (#_sdpos+2),hl
+fls_noxn:
+    ld hl,(#_xn)            ; a full step consumes one unit of the tracks chunk
+    ld de,#128              ; budget; at zero the whole chunk sits in the ring (the
+    or a                    ; last step may overshoot its end by <128 bytes: harmless,
+    sbc hl,de               ; FF 2F stops consumption before them). A short read is
+    jr c,fls_seteof         ; the eof. Either way no more SD time is spent here.
+    ld a,(#_curtrk)
+    add a,a
+    ld e,a
+    ld d,#0
+    ld hl,#_trk_steps
+    add hl,de
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    dec de
+    ld (hl),d
+    dec hl
+    ld (hl),e
+    ld a,d
+    or e
+    jr nz,fls_noeof
+fls_seteof:
+    ld a,(#_curtrk)
+    ld hl,#_l2_eof
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld (hl),#1
+fls_noeof:
+    ret
+    __endasm;
 }
 
 // Refills the active track's L1 cache from its L2 ring (a RAM copy). If the ring
 // is dry (prefetching could not keep up), a single bounded step is read from the
 // SD and we move on. No data at all -> end of track.
-void trk_refill (void)
+void trk_refill (void) __naked
 {
-    xn = *(WORD *)&cur.l2end - *(WORD *)&cur.off;
-    if (xn == 0)
-        l2_fillstep ();    // ring dry: borrow one bounded step; xn = bytes it read
-    if (xn > tcsize)
-        xn = tcsize;
-    rem = l2_area - (cur.bank & lmask);               // contiguous run up to the window end
-    if (xn > rem)
-        xn = rem;
-    if (xn == 0)
-        trk_end[curtrk] = 1;
-    else
-    {
-        bankmove (cur.bank, cptr, xn, 0);
-        cur.bank += xn;
-        if (!(cur.bank & lmask))                      // hit the window end: wrap to its base
-            cur.bank -= l2_area;
-        cur.off += xn;
-    }
-    rdptr = cptr;
-    rdend = cptr + xn;
+    __asm
+    ld hl,#_cur
+    push hl
+    call _trk_remaining
+    pop de
+    ld (#_xn),hl
+    ld a,h
+    or l
+    call z,_l2_fillstep      ; ring dry: borrow one bounded step; xn = bytes it read
+    ld hl,(#_tcsize)
+    ld de,(#_xn)
+    or a
+    sbc hl,de                ; hl = tcsize - xn
+    jr nc,trf_t1              ; tcsize >= xn: keep xn as is
+    ld hl,(#_tcsize)
+    ld (#_xn),hl
+trf_t1:
+    ld hl,(#_cur+8)          ; cur.bank
+    ld de,(#_lmask)
+    ld a,h
+    and d
+    ld h,a
+    ld a,l
+    and e
+    ld l,a                   ; hl = cur.bank & lmask
+    ex de,hl
+    ld hl,(#_l2_area)
+    or a
+    sbc hl,de                ; hl = l2_area - (cur.bank & lmask) = rem
+    ld (#_rem),hl
+    ex de,hl                 ; de = rem
+    ld hl,(#_xn)
+    or a
+    sbc hl,de                ; hl = xn - rem
+    jr c,trf_t2               ; xn < rem: keep xn
+    ld hl,(#_rem)
+    ld (#_xn),hl              ; xn = rem
+trf_t2:
+    ld hl,(#_xn)
+    ld a,h
+    or l
+    jr nz,trf_have_data
+    ld a,(#_curtrk)
+    ld hl,#_trk_end
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld (hl),#1               ; trk_end[curtrk] = 1
+    jr trf_done
+trf_have_data:
+    xor a,a                  ; bankmove(cur.bank, cptr, xn, 0)
+    push af
+    inc sp
+    ld hl,(#_xn)
+    push hl
+    ld hl,(#_cptr)
+    push hl
+    ld hl,(#_cur+8)
+    push hl
+    call _bankmove
+    pop af
+    pop af
+    pop af
+    inc sp
+    ld hl,(#_cur+8)          ; cur.bank += xn
+    ld de,(#_xn)
+    add hl,de
+    ld (#_cur+8),hl
+    ld de,(#_lmask)
+    ld a,h
+    and d
+    ld d,a
+    ld a,l
+    and e
+    ld e,a                   ; de = cur.bank & lmask
+    ld a,d
+    or e
+    jr nz,trf_no_wrap
+    ld hl,(#_cur+8)          ; hit the window end: wrap to its base
+    ld de,(#_l2_area)
+    or a
+    sbc hl,de
+    ld (#_cur+8),hl
+trf_no_wrap:
+    ld hl,(#_cur+0)          ; cur.off += xn (32-bit: propagate the carry)
+    ld de,(#_xn)
+    add hl,de
+    ld (#_cur+0),hl
+    jr nc,trf_done
+    ld hl,(#_cur+2)
+    inc hl
+    ld (#_cur+2),hl
+trf_done:
+    ld hl,(#_cptr)
+    ld (#_rdptr),hl          ; rdptr = cptr
+    ld de,(#_xn)
+    add hl,de
+    ld (#_rdend),hl          ; rdend = cptr + xn
+    ret
+    __endasm;
 }
 
 // Lee y consume el siguiente byte de la pista activa
-BYTE trk_get (void)
+BYTE trk_get (void) __naked
 {
-    if (rdptr == rdend)
-    {
-        trk_refill();
-        if (trk_end[curtrk])
-            return 0;
-    }
-    return *rdptr++;
+    __asm
+    ld hl,(#_rdptr)
+    ld de,(#_rdend)
+    or a
+    sbc hl,de
+    jr nz,tg_have_data
+    call _trk_refill
+    ld a,(#_curtrk)
+    ld hl,#_trk_end
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld a,(hl)
+    or a,a
+    jr z,tg_have_data
+    ld l,#0
+    ret
+tg_have_data:
+    ld hl,(#_rdptr)
+    ld a,(hl)
+    inc hl
+    ld (#_rdptr),hl
+    ld l,a
+    ret
+    __endasm;
 }
 
 // Lee una cantidad de longitud variable (delta o longitud de metaevento/sysex).
 // El caso comun (un solo byte) no hace ningun desplazamiento de 32 bits.
-DWORD trk_varlen (void)
+DWORD trk_varlen (void) __naked
 {
-    DWORD v;
-
-    c = trk_get();
-    v = c & 0x7F;
-    while (c & 0x80)
-    {
-        c = trk_get();
-        v = (v<<7) | (c & 0x7F);
-    }
-    return v;
+    // SDCC's z80 DWORD return convention: DE = low word, HL = high word
+    // (confirmed empirically: a function returning the constant 5 compiles to
+    // DE=5, HL=0, and DWORD addition carries E->D->L->H).
+    __asm
+    call _trk_get
+    ld a,l
+    ld (#_c),a
+    and a,#0x7F
+    ld e,a
+    ld d,#0
+    ld h,#0
+    ld l,#0                  ; v = c & 0x7F
+tv_loop:
+    ld a,(#_c)
+    and a,#0x80
+    jr z,tv_done
+    push de
+    push hl
+    call _trk_get
+    ld a,l
+    ld (#_c),a
+    pop hl
+    pop de
+    ld b,#7                  ; v <<= 7
+tv_shift:
+    sla e
+    rl d
+    rl l
+    rl h
+    djnz tv_shift
+    ld a,(#_c)                ; v |= c & 0x7F
+    and a,#0x7F
+    or e
+    ld e,a
+    jr tv_loop
+tv_done:
+    ret
+    __endasm;
 }
 
 // Procesa un evento de la pista activa (el delta ya se consumió antes).
 // A diferencia del reproductor de formato 0, aqui SIEMPRE se envia el byte de
 // estado: el running status de la linea MIDI se rompe al intercalar pistas.
-void trk_event (void)
+void trk_event (void) __naked
 {
-    BYTE st, n, b;
+    // Scratch: evst holds the resolved status byte (st); c holds b (0xFF sentinel
+    // meaning "first data byte not yet read"); param1 doubles as n outside the
+    // metaevent branch (disjoint uses, never live at the same time).
+    __asm
+    call _trk_get
+    ld a,l
+    ld (#_c),a               ; c = b
+    bit 7,a
+    jr z,tev_running          ; b&0x80==0: running status, b is the first data byte
+    ld (#_evst),a             ; st = b
+    cp a,#0xF0
+    jr nc,tev_no_update       ; st>=0xF0: sysex/meta never touch running status
+    ld hl,#_trk_status
+    ld a,(#_curtrk)
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld a,(#_evst)
+    ld (hl),a                 ; trk_status[curtrk] = st
+tev_no_update:
+    ld a,#0xFF
+    ld (#_c),a                ; b = 0xFF: first data byte not read yet
+    jr tev_haveSt
+tev_running:
+    ld a,(#_curtrk)
+    ld hl,#_trk_status
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld a,(hl)
+    ld (#_evst),a             ; st = trk_status[curtrk]
+tev_haveSt:
+    ld a,(#_evst)
+    cp a,#0xF0
+    jr z,tev_sysex
+    cp a,#0xF7
+    jr z,tev_sysex
+    cp a,#0xFF
+    jp z,tev_meta
+    jp tev_channel
 
-    b = trk_get();
-    if (b & 0x80)          // byte de estado nuevo
-    {
-        st = b;
-        if (st < 0xF0)     // solo los estados de canal actualizan el running status:
-            trk_status[curtrk] = st;   // sysex y metaeventos no lo cancelan (SMF es asi de laxo)
-        b = 0xFF;          // señal: el primer byte de datos aun no se ha leido
-    }
-    else
-        st = trk_status[curtrk];   // running status: b ya es el primer byte de datos
+tev_sysex:
+    xor a,a
+    ld (#_wire_status),a
+    call _trk_varlen
+    ld (#_lbytes),de          ; lbytes = trk_varlen() (truncated to WORD)
+    ld a,(#_evst)
+    cp a,#0xF0
+    jr nz,tev_sx_loop
+    ld a,#0xF0
+    ld (#_buffer),a
+    ld a,#1
+    push af
+    inc sp
+    ld hl,#_buffer
+    push hl
+    call _SendMIDI
+    pop af
+    inc sp
+tev_sx_loop:
+    ld hl,(#_lbytes)
+    ld a,h
+    or l
+    jp z,tev_return
+    ld de,#48
+    or a
+    sbc hl,de
+    jr c,tev_sx_small
+    ld a,#48
+    jr tev_sx_nset
+tev_sx_small:
+    ld a,(#_lbytes)
+tev_sx_nset:
+    ld (#_param1),a           ; n
+    xor a,a
+    ld (#_i),a
+tev_sx_byteloop:
+    ld a,(#_param1)
+    ld b,a
+    ld a,(#_i)
+    cp a,b
+    jr nc,tev_sx_bytesdone
+    call _trk_get
+    ld c,l
+    ld a,(#_i)
+    ld hl,#_buffer
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld (hl),c
+    ld hl,#_i
+    inc (hl)
+    jr tev_sx_byteloop
+tev_sx_bytesdone:
+    ld a,(#_param1)
+    push af
+    inc sp
+    ld hl,#_buffer
+    push hl
+    call _SendMIDI
+    pop af
+    inc sp
+    ld hl,(#_lbytes)
+    ld a,(#_param1)
+    ld e,a
+    ld d,#0
+    or a
+    sbc hl,de
+    ld (#_lbytes),hl          ; lbytes -= n
+    jr tev_sx_loop
 
-    // EVENTOS F0 y F7 (SYSEX). Se envian por trozos usando el buffer como staging.
-    // Un sysex cancela el running status del cable.
-    if (st == 0xF0 || st == 0xF7)
-    {
-        wire_status = 0;
-        lbytes = trk_varlen();
-        if (st == 0xF0)
-        {
-            buffer[0] = 0xF0;
-            SendMIDI (buffer, 1);
-        }
-        while (lbytes)
-        {
-            n = (lbytes > 48) ? 48 : lbytes;   // el staging son los primeros 48 bytes del buffer
-            for (i=0;i<n;i++)
-                buffer[i] = trk_get();
-            SendMIDI (buffer, n);
-            lbytes -= n;
-        }
-        return;
-    }
+tev_meta:
+    call _trk_get
+    ld a,l
+    ld (#_param1),a           ; param1 = trk_get()
+    call _trk_varlen
+    ld (#_lbytes),de
+    ld a,(#_param1)
+    cp a,#0x2F
+    jr nz,tev_meta_tempo
+    ld a,(#_curtrk)
+    ld hl,#_trk_end
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld (hl),#1                ; trk_end[curtrk] = 1
+    ret
+tev_meta_tempo:
+    ld a,(#_param1)
+    cp a,#0x51
+    jr nz,tev_meta_skip
+    ld hl,(#_lbytes)
+    ld de,#3
+    or a
+    sbc hl,de
+    jr nz,tev_meta_skip        ; lbytes != 3
+    xor a,a
+    ld (#_us_per_quarter+3),a
+    call _trk_get
+    ld a,l
+    ld (#_us_per_quarter+2),a
+    call _trk_get
+    ld a,l
+    ld (#_us_per_quarter+1),a
+    call _trk_get
+    ld a,l
+    ld (#_us_per_quarter+0),a
+    call _settempo
+    ret
+tev_meta_skip:
+    ld hl,(#_lbytes)
+tev_meta_skiploop:
+    ld a,h
+    or l
+    jp z,tev_return
+    push hl
+    call _trk_get
+    pop hl
+    dec hl
+    ld (#_lbytes),hl
+    jr tev_meta_skiploop
 
-    // METAEVENTOS FF. Todos tienen la forma FF tipo longitud datos, asi que se
-    // pueden saltar de forma generica. Solo tempo y fin de pista nos interesan.
-    if (st == 0xFF)
-    {
-        param1 = trk_get();     // aqui b siempre es 0xFF: FF nunca llega por running status
-        lbytes = trk_varlen();
-        if (param1 == 0x2F)          // fin de pista
-        {
-            trk_end[curtrk] = 1;
-            return;
-        }
-        if (param1 == 0x51 && lbytes == 3)   // Set Tempo: se aplica globalmente
-        {
-            ((BYTE *)&us_per_quarter)[3] = 0;
-            ((BYTE *)&us_per_quarter)[2] = trk_get();
-            ((BYTE *)&us_per_quarter)[1] = trk_get();
-            ((BYTE *)&us_per_quarter)[0] = trk_get();
-            settempo ();
-            return;
-        }
-        while (lbytes--)             // el resto de metaeventos se ignora
-            trk_get();
-        return;
-    }
-
-    // EVENTOS de canal: estado + 1 o 2 bytes de datos, via staging. Si el estado
-    // coincide con el último enviado por el cable, se omite (running status de salida):
-    // a 31250 baudios cada byte ahorrado son 320us, y en los pasajes densos se nota.
-    n = 0;
-    if (st != wire_status)
-    {
-        wire_status = st;
-        buffer[n++] = st;
-    }
-    buffer[n++] = (b != 0xFF) ? b : trk_get();
-    if ((st & 0xE0) != 0xC0)       // C0 (program) y D0 (pressure) llevan 1 solo dato
-        buffer[n++] = trk_get();
-    SendMIDI (buffer, n);
+tev_channel:
+    xor a,a
+    ld (#_param1),a           ; n = 0
+    ld a,(#_evst)
+    ld hl,#_wire_status
+    cp a,(hl)
+    jr z,tev_ch_skipws
+    ld (hl),a                 ; wire_status = st
+    ld hl,#_buffer
+    ld (hl),a                 ; buffer[0] = st
+    ld a,#1
+    ld (#_param1),a           ; n = 1
+tev_ch_skipws:
+    ld a,(#_c)                ; b
+    cp a,#0xFF
+    jr nz,tev_ch_haveb
+    call _trk_get
+    ld a,l
+tev_ch_haveb:
+    ld c,a
+    ld a,(#_param1)
+    ld hl,#_buffer
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld (hl),c
+    inc a
+    ld (#_param1),a           ; n++
+    ld a,(#_evst)
+    and a,#0xE0
+    cp a,#0xC0
+    jr z,tev_ch_send
+    call _trk_get
+    ld c,l
+    ld a,(#_param1)
+    ld hl,#_buffer
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld (hl),c
+    inc a
+    ld (#_param1),a
+tev_ch_send:
+    ld a,(#_param1)
+    push af
+    inc sp
+    ld hl,#_buffer
+    push hl
+    call _SendMIDI
+    pop af
+    inc sp
+tev_return:
+    ret
+    __endasm;
 }
 
-// One prefetch step for the most depleted L2 ring, so the SD cost lands in the
-// quiet gaps of the music instead of on top of dense passages. Remaining-byte
-// counts fit in 16 bits.
-void l2_prefetch (void)
+// One prefetch step per quiet frame, so the SD cost lands in the gaps of the
+// music instead of on top of dense passages. Remaining-byte counts fit in 16 bits.
+//
+// Service policy — sticky bursts over a worst-ring trigger:
+//  - while the track of the last SD read still has room for a whole step, keep
+//    serving IT (up to a FULL ring): those reads are sequential, no seek at all.
+//    Serving the strict per-frame minimum instead used to ping-pong between two
+//    draining tracks (both hovering just under the half watermark), paying a
+//    FAT-walk seek nearly every 128-byte step;
+//  - once it is full, the most depleted live ring below the half watermark opens
+//    the next burst. Picking the worst ring (rather than a rotating candidate)
+//    bounds any track's wait to one idle frame regardless of track count, so no
+//    ring reaches zero mid-passage and forces trk_refill()'s synchronous
+//    l2_fillstep() fallback right in the middle of live events;
+//  - a burst OPENS with a seek-only frame: the FAT-walk seek and the first read
+//    back to back can outlast the frame even from an early phase (every /INT
+//    falling while the IM2 clock is dismounted is lost), and split apart each
+//    half fits comfortably. The reads then follow seek-free.
+void l2_prefetch (void) __naked
 {
-    // Burst behaviour: keep topping up the track of the last SD read while it has
-    // room — its steps are sequential, so they need no seek. Only when that ring is
-    // full (or its track is dead) consider ONE rotating candidate per frame, and
-    // start a new burst only for a ring drained below HALF: an esxdos seek walks
-    // the whole FAT chain and costs real milliseconds, so SD work must happen in
-    // few long sequential bursts, not round-robin pokes (those lost enough clock
-    // frames to audibly drag the tempo).
-    // (sd_trk is always valid here: the startup prefill reads every track once.
-    // A track that ended must not be topped up — its ring would swallow the next
-    // track's file region. An EOF ring is cheaper to let fillstep reject.)
-    if (!trk_end[sd_trk])
-    {
-        set_curtrk (sd_trk);
-        l2_fillstep ();
-        if (xn)
-            return;                // the burst goes on next idle frame
-    }
-    if (++pick >= tracks)          // pick/pst rotate together, one candidate per frame
-    {
-        pick = 0;
-        pst = tst;
-    }
-    else
-        pst++;
-    if (trk_end[pick] || l2_eof[pick])
-        return;
-    // curtrk's tst slot may be stale (its live state sits in cur between switches).
-    // Harmless: at worst its burst starts a frame late, or set_curtrk degrades into
-    // its t==curtrk shortcut plus a fillstep that reads the fresh mirrors.
-    remt = *(WORD *)&pst->l2end - *(WORD *)&pst->off;
-    if (remt < (l2_area >> 1))     // low watermark
-    {
-        set_curtrk (pick);
-        l2_fillstep ();
-    }
+    __asm
+    ld a,#0xFF
+    ld (#_c),a                ; c: worst track found so far (0xFF = none live)
+    ld hl,#0xFFFF
+    ld (#_xn),hl               ; xn: its remaining ring bytes
+    ld (#_rem),hl              ; rem: sd_trk's remaining bytes (0xFFFF = not live)
+    ld hl,#_tst
+    ld (#_pst),hl              ; pst = tst: walk with a pointer, no per-track multiply
+    xor a,a
+    ld (#_trkn),a
+lpf_loop:
+    ld a,(#_trkn)
+    ld hl,#_tracks
+    cp a,(hl)
+    jp nc,lpf_loopdone
+    ld a,(#_trkn)
+    ld hl,#_trk_end
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld a,(hl)
+    or a,a
+    jr nz,lpf_next
+    ld a,(#_trkn)
+    ld hl,#_l2_eof
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld a,(hl)
+    or a,a
+    jr nz,lpf_next
+    ld a,(#_trkn)
+    ld b,a
+    ld a,(#_curtrk)
+    cp a,b
+    jr nz,lpf_use_pst
+    ld hl,#_cur                ; curtrk's tst slot is stale (its live state sits in
+    push hl                    ; cur between switches): read the mirror instead so
+    call _trk_remaining        ; its real urgency is seen.
+    pop de
+    jr lpf_have_remt
+lpf_use_pst:
+    ld hl,(#_pst)
+    push hl
+    call _trk_remaining
+    pop de
+lpf_have_remt:
+    ld (#_remt),hl
+    ld a,(#_sd_trk)            ; remember the last-read track's level as we pass it
+    ld b,a
+    ld a,(#_trkn)
+    cp a,b
+    jr nz,lpf_not_sd
+    ld (#_rem),hl
+lpf_not_sd:
+    ld hl,(#_remt)
+    ld de,(#_xn)
+    or a
+    sbc hl,de                  ; hl = remt - xn
+    jr nc,lpf_next              ; remt >= xn: not worse
+    ld hl,(#_remt)
+    ld (#_xn),hl
+    ld a,(#_trkn)
+    ld (#_c),a
+lpf_next:
+    ld hl,(#_pst)
+    ld de,#12
+    add hl,de
+    ld (#_pst),hl
+    ld hl,#_trkn
+    inc (hl)
+    jr lpf_loop
+lpf_loopdone:
+    ld a,(#_c)
+    inc a
+    jr z,lpf_return              ; c == 0xFF: nobody live
+    ld hl,(#_l2_area)            ; stickiness: while the last-read track's ring has
+    ld de,#-127                  ; room for a whole step, keep serving IT (up to a
+    add hl,de                    ; FULL ring) even if another ring is lower — its
+    ex de,hl                     ; reads are sequential (no FAT-walk seek). Serving
+    ld hl,(#_rem)                ; the strict minimum used to ping-pong between two
+    or a                         ; draining tracks, paying a seek nearly every step
+    sbc hl,de                    ; (both hover just under the half watermark);
+    jr nc,lpf_worst              ; long bursts amortize one seek over ~16 steps.
+    ld a,(#_sd_trk)
+    ld (#_c),a
+    jr lpf_go
+lpf_worst:
+    ld de,(#_l2_area)
+    srl d
+    rr e                          ; de = l2_area >> 1
+    ld hl,(#_xn)
+    or a
+    sbc hl,de                    ; hl = xn - (l2_area>>1)
+    jr c,lpf_go                   ; xn < threshold: worth a step
+    jr lpf_return                  ; xn >= threshold: all above the low watermark
+lpf_go:
+    ld a,(#_c)
+    push af
+    inc sp
+    call _set_curtrk
+    inc sp                   ; only 1 net byte was pushed for this single BYTE arg
+    ld a,(#_sd_trk)          ; opening a new burst? split the FAT-walk seek into its
+    ld hl,#_curtrk           ; own frame: seek+read back to back can outlast the
+    cp a,(hl)                ; frame even from an early phase, and the read follows
+    jr z,lpf_fill            ; on the next idle frame with no seek at all
+    call _im2_off
+    call _seeknext           ; to cur.l2end
+    ld hl,(#_cur+4)          ; the file pointer moved with no read to account for
+    ld (#_sdpos),hl          ; it: track it, or the next relative seek would hop
+    ld hl,(#_cur+6)          ; from a stale base
+    ld (#_sdpos+2),hl
+    ld a,(#_curtrk)
+    ld (#_sd_trk),a
+    call _im2_on
+    ret
+lpf_fill:
+    call _l2_fillstep
+lpf_return:
+    ret
+    __endasm;
 }
 
 // Bucle principal de reproduccion.
@@ -760,148 +1497,547 @@ void l2_prefetch (void)
 // Devuelve 0 si se ha reproducido, 1 si no se encontro ninguna pista MTrk.
 // Recorre los chunks del fichero construyendo la tabla de offsets de comienzo de
 // cada pista. La longitud de cada chunk está en su cabecera.
-void scan_tracks (BYTE ntrk)
+void scan_tracks (BYTE ntrk) STACKARGS
 {
-    DWORD len, fpos;
+    // Scratch: fpos lives directly in cur.l2end (exactly what the C version
+    // copied it into before each seeknext anyway), len in cur.off (the other
+    // DWORD field of the same, otherwise-idle scratch struct).
+    __asm
+    xor a,a
+    ld (#_tracks),a
+    ld hl,#14
+    ld (#_cur+4),hl
+    ld hl,#0
+    ld (#_cur+6),hl           ; fpos = 14
+    ld hl,#_tst
+    ld (#_pst),hl             ; pst = tst
+    ld hl,#0
+    ld (#_lbytes),hl          ; lbytes = 0
+st_loop:
+    ld a,(#_tracks)
+    ld b,a
+    ld a,4(ix)
+    cp a,b
+    jp c,st_done               ; ntrk < tracks: can't happen normally, but be safe
+    jp z,st_done                ; tracks == ntrk: done
+    ld a,(#_tracks)
+    cp a,#17
+    jp nc,st_done               ; tracks >= MAX_TRACKS: done
 
-    tracks = 0;
-    fpos = 14;
-    pst = tst;
-    lbytes = 0;        // running ring base (lbytes is free until playback starts)
-    while (tracks < ntrk && tracks < MAX_TRACKS)
-    {
-        seekset (fhandle, fpos);
-        if (read (fhandle, buffer, 8) != 8)
-            break;
-        // longitud del chunk (big-endian en el fichero), compuesta byte a byte:
-        // mucho mas compacto que desplazamientos de 32 bits (somos little-endian)
-        ((BYTE *)&len)[0] = buffer[7];
-        ((BYTE *)&len)[1] = buffer[6];
-        ((BYTE *)&len)[2] = buffer[5];
-        ((BYTE *)&len)[3] = buffer[4];
-        fpos += 8;
-        if (((WORD *)buffer)[0] == 0x544D && ((WORD *)buffer)[1] == 0x6B72)   // "MTrk"
-        {
-            pst->off = fpos;
-            pst->l2end = fpos;             // ring vacio: el primer uso lo rellena
-            pst->bank = lbytes;            // each ring starts empty at its base
-            pst->cpos = 0;
-            pst->clen = 0;
-            pst++;
-            lbytes += l2_area;
-            l2_eof[tracks] = 0;
-            trk_status[tracks] = 0;
-            trk_end[tracks] = 0;
-            tracks++;
-        }
-        fpos += len;    // chunks desconocidos se saltan sin contarlos
-    }
+    call _seeknext             ; to cur.l2end (fpos)
+    ld hl,#8
+    push hl
+    ld hl,#_buffer
+    push hl
+    ld a,(#_fhandle)
+    push af
+    inc sp
+    call _read
+    pop af
+    pop af
+    inc sp
+    ld de,#8
+    or a
+    sbc hl,de
+    jp nz,st_done               ; read() != 8: break
+
+    ld a,(#_buffer+7)           ; len (big-endian in the file), into cur.off
+    ld (#_cur+0),a
+    ld a,(#_buffer+6)
+    ld (#_cur+1),a
+    ld a,(#_buffer+5)
+    ld (#_cur+2),a
+    ld a,(#_buffer+4)
+    ld (#_cur+3),a
+
+    ld hl,(#_cur+4)             ; fpos += 8
+    ld de,#8
+    add hl,de
+    ld (#_cur+4),hl
+    jr nc,st_fpos8done
+    ld hl,(#_cur+6)
+    inc hl
+    ld (#_cur+6),hl
+st_fpos8done:
+
+    ld hl,(#_buffer+0)          ; "MTrk"?
+    ld de,#0x544D
+    or a
+    sbc hl,de
+    jp nz,st_skip_mtrk
+    ld hl,(#_buffer+2)
+    ld de,#0x6B72
+    or a
+    sbc hl,de
+    jp nz,st_skip_mtrk
+
+    ld hl,(#_pst)
+    ld de,(#_cur+4)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld de,(#_cur+6)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl                      ; pst->off = fpos
+    ld de,(#_cur+4)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld de,(#_cur+6)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl                      ; pst->l2end = fpos
+    ld de,(#_lbytes)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl                      ; pst->bank = lbytes
+    ld (hl),#0
+    inc hl
+    ld (hl),#0                  ; pst->cpos = pst->clen = 0
+    inc hl
+    ld (#_pst),hl               ; pst++
+
+    ld hl,(#_lbytes)
+    ld de,(#_l2_area)
+    add hl,de
+    ld (#_lbytes),hl            ; lbytes += l2_area
+
+    ld a,(#_cur+3)               ; trk_steps[tracks] = (WORD)(len>>7) + 1
+    ld b,a
+    ld a,(#_cur+2)
+    ld c,a
+    ld a,(#_cur+1)
+    ld d,a
+    ld a,(#_cur+0)
+    ld e,a
+    srl b
+    rr c
+    rr d
+    rr e
+    srl b
+    rr c
+    rr d
+    rr e
+    srl b
+    rr c
+    rr d
+    rr e
+    srl b
+    rr c
+    rr d
+    rr e
+    srl b
+    rr c
+    rr d
+    rr e
+    srl b
+    rr c
+    rr d
+    rr e
+    srl b
+    rr c
+    rr d
+    rr e                         ; de = len >> 7 (7 single-bit shifts, BCDE)
+    inc de
+    ld a,(#_tracks)
+    ld l,a
+    ld h,#0
+    add hl,hl
+    ld bc,#_trk_steps
+    add hl,bc
+    ld (hl),e
+    inc hl
+    ld (hl),d
+
+    ld a,(#_tracks)
+    ld l,a
+    ld h,#0
+    ld bc,#_l2_eof
+    add hl,bc
+    ld (hl),#0                   ; l2_eof[tracks] = 0
+    ld a,(#_tracks)
+    ld l,a
+    ld h,#0
+    ld bc,#_trk_status
+    add hl,bc
+    ld (hl),#0                   ; trk_status[tracks] = 0
+    ld a,(#_tracks)
+    ld l,a
+    ld h,#0
+    ld bc,#_trk_end
+    add hl,bc
+    ld (hl),#0                   ; trk_end[tracks] = 0
+    ld hl,#_tracks
+    inc (hl)                     ; tracks++
+
+st_skip_mtrk:
+    ld hl,(#_cur+4)               ; fpos += len (32-bit add)
+    ld de,(#_cur+0)
+    add hl,de
+    ld (#_cur+4),hl
+    ld hl,(#_cur+6)
+    ld de,(#_cur+2)
+    adc hl,de
+    ld (#_cur+6),hl
+    jp st_loop
+st_done:
+    __endasm;
 }
 
-BYTE playmidi1 (BYTE ntrk)
+BYTE playmidi1 (BYTE ntrk) STACKARGS
 {
-    BYTE best;
+    // Scratch: param1 doubles as 'best' (the meta-event branch of trk_event
+    // never runs concurrently with this function's own body).
+    __asm
+    ld hl,#0x8000
+    ld (#_l2_area),hl
+    ld a,#2
+    ld (#_i),a
+pm1_szloop:
+    ld a,(#_i)
+    or a,a
+    jr z,pm1_szdone
+    cp a,4(ix)
+    jr nc,pm1_szdone
+    ld hl,(#_l2_area)
+    srl h
+    rr l
+    ld (#_l2_area),hl
+    ld a,(#_i)
+    add a,a
+    ld (#_i),a
+    jr pm1_szloop
+pm1_szdone:
+    ld hl,(#_l2_area)
+    dec hl
+    ld (#_lmask),hl
+    ld a,#0xFF
+    ld (#_sd_trk),a
 
-    // L2 ring per track: the largest power of two such that all the tracks fit in
-    // the 64KB of banks (a power of two makes every ring wrap a masking operation).
-    // Sized from the header's track count, so scan_tracks can hand out ring bases.
-    // (The "i &&" guard stops the loop when i wraps to 0 on absurd track counts.)
-    l2_area = 0x8000;                      // 1-2 tracks: two 32KB halves
-    for (i = 2; i && i < ntrk; i <<= 1)
-        l2_area >>= 1;
-    lmask = l2_area - 1;
-    sd_trk = 0xFF;
+    ld a,4(ix)
+    push af
+    inc sp
+    call _scan_tracks
+    inc sp
 
-    scan_tracks (ntrk);
-    if (tracks == 0)
-        return 1;       // el que llama imprime el error
+    ld a,(#_tracks)
+    or a,a
+    jp nz,pm1_trackscheck_ok
+    ld l,#1
+    jp pm1_epilogue              ; el que llama imprime el error
+pm1_trackscheck_ok:
 
-    // Cuantas menos pistas, mas caché por pista (tope: 255, cpos/clen son BYTE)
-    tcsize = (WORD)TCACHE_TOTAL / (WORD)tracks;
-    if (tcsize > 255)
-        tcsize = 255;
+    ld hl,#0
+    ld (#_tcsize),hl
+    ld hl,#322
+    ld (#_remt),hl
+pm1_tcloop:
+    ld hl,(#_remt)
+    ld a,(#_tracks)
+    ld e,a
+    ld d,#0
+    or a
+    sbc hl,de
+    jr c,pm1_tcdone
+    ld (#_remt),hl
+    ld hl,(#_tcsize)
+    inc hl
+    ld (#_tcsize),hl
+    jr pm1_tcloop
+pm1_tcdone:
+    ld a,(#_tcsize+1)
+    or a,a
+    jr z,pm1_tcsize_ok
+    ld hl,#255
+    ld (#_tcsize),hl
+pm1_tcsize_ok:
 
-    // Leemos el primer delta de cada pista para inicializar su next_tick.
-    // Una pista terminada se marca con next_tick = 0xFFFFFFFF (centinela): asi el
-    // planificador no necesita consultar trk_end. De paso se llena del todo el ring
-    // de cada pista: la espera cae aqui, cuando aun no suena nada (un seek por
-    // pista y lecturas secuenciales), y con los ficheros que caben en los bancos
-    // la SD no se vuelve a tocar durante la musica.
-    curtrk = 0xFF;
-    best = 0;                                  // contador de pistas vivas
-    for (trkn = 0; trkn < tracks; trkn++)
-    {
-        set_curtrk (trkn);
-        do
-            l2_fillstep ();
-        while (xn);                            // hasta ring lleno o EOF
-        trk_next[trkn] = trk_varlen() << 6;    // <<6 == * PRECISION
-        if (trk_end[trkn])
-            trk_next[trkn] = 0xFFFFFFFF;
-        else
-            best++;
-    }
-    if (best == 0)
-        return 0;
+    ld a,#0xFF
+    ld (#_curtrk),a
+    xor a,a
+    ld (#_best),a
+    ld (#_trkn),a
+pm1_prefill_loop:
+    ld a,(#_trkn)
+    ld hl,#_tracks
+    cp a,(hl)
+    jp nc,pm1_prefill_done
+    ld a,(#_trkn)
+    push af
+    inc sp
+    call _set_curtrk
+    inc sp
+pm1_prefill_fillloop:
+    call _l2_fillstep
+    ld hl,(#_xn)
+    ld a,h
+    or l
+    jr nz,pm1_prefill_fillloop
+    call _trk_varlen              ; DE:HL = trk_varlen() (DE low, HL high)
+    ld b,#6
+pm1_prefill_shift:
+    sla e
+    rl d
+    rl l
+    rl h
+    djnz pm1_prefill_shift
+    ld a,(#_trkn)
+    add a,a
+    add a,a
+    ld c,a
+    ld b,#0
+    push hl
+    ld hl,#_trk_next
+    add hl,bc
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    pop de
+    ld (hl),e
+    inc hl
+    ld (hl),d
 
-    // Planificador al estilo de zx-midiplayer: una pasada por TODAS las pistas en
-    // cada frame ("¿te toca ya?": una sola comparacion por pista), y la pista que
-    // esta al dia vacia de golpe todos sus eventos pendientes hasta la siguiente
-    // pausa. Nada de buscar el tick minimo ni de reordenar: en los acordes densos
-    // el coste por evento se queda en el parseo y el cable, no en el planificador.
-    now = 0;
-    tfrac = 0;
-    wire_status = 0;
-    pick = 0;          // rotating prefetch candidate; pst mirrors it
-    pst = tst;
-    im2_on ();         // desde aqui el reloj lo lleva la ISR
-    cnt_last = int_cnt;
-    while (1)
-    {
-        // Si pulsamos SPACE, salir
-        if ((SEMIFILA8 & 0x1) == 0)
-            return 0;
+    ld a,(#_trkn)
+    ld hl,#_trk_end
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld a,(hl)
+    or a,a
+    jr z,pm1_pf_alive
+    ld a,(#_trkn)
+    add a,a
+    add a,a
+    ld c,a
+    ld b,#0
+    ld hl,#_trk_next
+    add hl,bc
+    ld (hl),#0xFF
+    inc hl
+    ld (hl),#0xFF
+    inc hl
+    ld (hl),#0xFF
+    inc hl
+    ld (hl),#0xFF
+    jr pm1_pf_next
+pm1_pf_alive:
+    ld hl,#_best
+    inc (hl)
+pm1_pf_next:
+    ld hl,#_trkn
+    inc (hl)
+    jp pm1_prefill_loop
+pm1_prefill_done:
+    ld a,(#_best)
+    or a,a
+    jp nz,pm1_main_start
+    ld l,#0
+    jp pm1_epilogue
+pm1_main_start:
+    ld hl,#0
+    ld (#_now),hl
+    ld (#_now+2),hl
+    xor a,a
+    ld (#_tfrac),a
+    ld (#_wire_status),a
+    call _im2_on
+    ld a,(#_int_cnt)
+    ld (#_cnt_last),a
 
-        tick_guard ();  // recover ticks eaten by DI send bursts (see its comment)
+pm1_mainloop:
+    ld bc,#0x7ffe
+    in a,(c)
+    and a,#1
+    jp nz,pm1_no_space
+    ld l,#0
+    jp pm1_epilogue
+pm1_no_space:
+    xor a,a
+    ld (#_hltf),a            ;assume catch-up pass (frame phase unknown)
+    ld a,(#_cnt_last)
+    ld hl,#_int_cnt
+    cp a,(hl)
+    jr nz,pm1_skip_halt
+    halt
+    ld a,#1                  ;woke ON the interrupt: phase is known from here on
+    ld (#_hltf),a
+    xor a,a
+    ld (#_txlast),a          ;wire bytes sent this frame: none yet
+    call _tx_flush           ;just woke ON the frame interrupt: the whole queue goes
+                             ;out with the next /INT a full frame away. Any other
+                             ;moment in the frame is a guess — a long sweep can end
+                             ;anywhere, even right on the edge — so this halt (and
+                             ;queue overflow, which self-credits) are the only two
+                             ;places that ever touch the wire.
+pm1_skip_halt:
+    ld hl,#_cnt_last
+    inc (hl)
+    ld hl,(#_now)
+    ld de,(#_ticks_per_int)
+    add hl,de
+    ld (#_now),hl
+    ld hl,(#_now+2)
+    ld de,(#_ticks_per_int+2)
+    adc hl,de
+    ld (#_now+2),hl
+    ld a,(#_tfrac)
+    ld hl,#_tpi_frac
+    add a,(hl)
+    ld (#_tfrac),a
+    jr nc,pm1_no_carry_now
+    ld hl,(#_now)
+    inc hl
+    ld (#_now),hl
+    ld a,h
+    or l
+    jr nz,pm1_no_carry_now
+    ld hl,(#_now+2)
+    inc hl
+    ld (#_now+2),hl
+pm1_no_carry_now:
 
-        // Un frame por vuelta: si la ISR no ha contado ninguno pendiente, dormimos.
-        // Si vamos con retraso (un pasaje denso tardo mas de un frame), se procesan
-        // vueltas seguidas sin dormir hasta ponerse al dia.
-        if (cnt_last == int_cnt)
-            WAIT_VRETRACE;
-        cnt_last++;
-        now += ticks_per_int;
-        tfrac += tpi_frac;         // accumulate the fractional ticks-per-frame...
-        if (tfrac < tpi_frac)      // ...8-bit wrap = a whole PRECISION unit: carry it
-            now++;
+    xor a,a
+    ld (#_fired),a
+    ld hl,#_trk_next
+    ld (#_pnext),hl
+    xor a,a
+    ld (#_trkn),a
+pm1_sched_loop:
+    ld a,(#_trkn)
+    ld hl,#_tracks
+    cp a,(hl)
+    jp nc,pm1_sched_done
+    ld hl,(#_pnext)
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+    ld c,(hl)
+    inc hl
+    ld b,(hl)                    ; BC:DE = *pnext (high:low)
+    ld hl,(#_now+2)
+    or a
+    sbc hl,bc
+    jp c,pm1_sched_next            ; now_high<pnext_high -> pnext>now -> skip
+    ld a,h
+    or l
+    jr nz,pm1_fire                 ; now_high>pnext_high -> pnext<now -> fire
+    ld hl,(#_now)
+    or a
+    sbc hl,de
+    jp c,pm1_sched_next            ; now_low<pnext_low (highs equal) -> pnext>now -> skip
+pm1_fire:
+    ld a,#1
+    ld (#_fired),a
+    ld a,(#_trkn)
+    push af
+    inc sp
+    call _set_curtrk
+    inc sp
+pm1_fire_loop:
+    call _trk_event
+    ld a,(#_trkn)
+    ld hl,#_trk_end
+    ld e,a
+    ld d,#0
+    add hl,de
+    ld a,(hl)
+    or a,a
+    jr z,pm1_fire_notend
+    ld hl,(#_pnext)
+    ld (hl),#0xFF
+    inc hl
+    ld (hl),#0xFF
+    inc hl
+    ld (hl),#0xFF
+    inc hl
+    ld (hl),#0xFF
+    ld hl,#_best
+    dec (hl)
+    ld a,(hl)
+    or a,a
+    jp nz,pm1_sched_next
+    ld l,#0
+    jp pm1_epilogue
+pm1_fire_notend:
+    call _trk_varlen
+    ld b,#6
+pm1_fire_shift:
+    sla e
+    rl d
+    rl l
+    rl h
+    djnz pm1_fire_shift
+    push hl
+    ld hl,(#_pnext)
+    ld a,(hl)
+    add a,e
+    ld (hl),a
+    inc hl
+    ld a,(hl)
+    adc a,d
+    ld (hl),a
+    inc hl
+    pop de
+    ld a,(hl)
+    adc a,e
+    ld (hl),a
+    inc hl
+    ld a,(hl)
+    adc a,d
+    ld (hl),a
 
-        fired = 0;
-        pnext = trk_next;
-        for (trkn = 0; trkn < tracks; trkn++, pnext++)
-        {
-            if (*pnext > now)          // aun no le toca (el centinela de pista
-                continue;              // terminada, 0xFFFFFFFF, nunca "toca")
-            fired = 1;
-            set_curtrk (trkn);
-            do
-            {
-                trk_event ();
-                if (trk_end[trkn])
-                {
-                    *pnext = 0xFFFFFFFF;
-                    if (--best == 0)   // no quedan pistas vivas
-                        return 0;
-                    break;
-                }
-                *pnext += trk_varlen() << 6;    // <<6 == * PRECISION
-            }
-            while (*pnext <= now);
-        }
-
-        // Event-less frame: the perfect slot for one prefetch step
-        if (!fired)
-            l2_prefetch ();
-    }
+    ld hl,(#_pnext)
+    ld e,(hl)
+    inc hl
+    ld d,(hl)
+    inc hl
+    ld c,(hl)
+    inc hl
+    ld b,(hl)
+    ld hl,(#_now+2)
+    or a
+    sbc hl,bc
+    jp c,pm1_sched_next
+    ld a,h
+    or l
+    jp nz,pm1_fire_loop
+    ld hl,(#_now)
+    or a
+    sbc hl,de
+    jp c,pm1_sched_next
+    jp pm1_fire_loop
+pm1_sched_next:
+    ld hl,(#_pnext)
+    ld de,#4
+    add hl,de
+    ld (#_pnext),hl
+    ld hl,#_trkn
+    inc (hl)
+    jp pm1_sched_loop
+pm1_sched_done:
+    ld a,(#_fired)
+    or a,a
+    jr nz,pm1_loop_end
+    ld a,(#_hltf)            ;an SD step dismounts the IM2 clock for a few ms, and
+    or a,a                   ;every /INT falling inside is silently lost — so only
+    jr z,pm1_loop_end        ;take one when the frame phase is provably early: the
+    ld a,(#_txlast)          ;pass began with a halt (phase 0) and at most 8 wire
+    cp a,#9                  ;bytes (~3ms) went out since — a slow SD step (~12ms)
+    jr nc,pm1_loop_end       ;still fits the frame. Skipped steps just wait for
+                             ;the next quiet frame.
+    call _l2_prefetch
+pm1_loop_end:
+    jp pm1_mainloop
+pm1_epilogue:
+    __endasm;
 }
 
 /* ============================ FORMAT1 ENGINE END ============================ */
@@ -937,11 +2073,12 @@ void playmidi (BYTE f)
     im2_off ();
     if (rem > 2000)
         rem = 1000;                     // wild reading (turbo, NTSC...): assume 50Hz as before
-    else if (rem > 1100 && rem < 1420)
-        rem = 992;                      // 128K/+2/+3: reading inflated by the 1.3% faster crystal
+    else if ((WORD)(rem - 1101) < 319)
+        rem = 992;                      // 128K/+2/+3 window: reading inflated by the faster crystal
     us_per_int = rem + 19000;
-    sent = 0;
-    tpi_frac = 0;                       // settempo sets it for real right below
+    txlen = 0;
+    ((BYTE *)&sdpos)[3] = 0xFF;         // poison the position high: seeknext goes absolute
+                                        // until the first playback read tracks it for real
 
     // Leemos el PPQ (partes por quarter, o el numero de ticks del reloj de MIDI que dura una negra
     ppq = ((WORD)buffer[12]<<8) | buffer[13];
@@ -986,45 +2123,41 @@ void playmidi (BYTE f)
 #pragma disable_warning 85
 #pragma disable_warning 59
 
-// Envia un bloque de memoria a la salida MIDI del Spectrum
+// Queues a block of memory for the MIDI output. Nothing touches the wire here:
+// the queue is drained by tx_flush, normally once per frame right after the
+// event sweep (or here, when the queue would overflow — the flush then credits
+// any interrupt the oversized burst provably ate, see tx_flush).
 void SendMIDI (BYTE *ev, BYTE lev) STACKARGS
 {
-  BYTE d;
-
-  sent += lev;   // wire-time bookkeeping for tick_guard
-
-  // Si estamos en el ZXUNO, esta operación debe hacerse a la velocidad estándar (3.5 MHz)
-  ZXUNOADDR = 0xb;
-  d = ZXUNODATA;
-  ZXUNODATA = d & 0x3F;
   __asm
   push bc
   push de
+  ld a,(#_txlen)
+  cp a,#56                 ;>= 56 queued: the flush window is already >= 1 whole
+  jr nc,smq_flush          ;frame of wire, so its credit accounting is exact —
+                           ;flushing now keeps every overflow window that tight
+  add a,6(ix)              ;txlen + lev
+  cp a,#(80+1)             ;TXBUF_CAP
+  jr c,smq_room
+smq_flush:
+  call _tx_flush           ;drain what is queued first
+  ld a,6(ix)
+smq_room:
+  ld hl,#_txlen            ;dest = txbuf + old txlen; txlen = txlen + lev
+  ld d,#0
+  ld e,(hl)
+  ld (hl),a
+  ld hl,#_txbuf
+  add hl,de
+  ex de,hl                 ;de = append position
   ld l,4(ix)
-  ld h,5(ix)
-  ld b,6(ix)
-
-buc_send_midi:
-  ld a,(hl)
-  push bc
-  push hl
-  di
-  call _SendMIDIByte   ;llamada a la rutina para enviar un byte por MIDI
-  ei
-  pop hl
-  pop bc
-  inc hl
-  ld a,h
-  and #0xF3  ;esto asume que el buffer esta en 0x3000 - 0x33FF
-  ld h,a
-  djnz buc_send_midi
-
+  ld h,5(ix)               ;hl = ev
+  ld c,6(ix)
+  ld b,#0                  ;bc = lev (never 0: all callers pass at least 1)
+  ldir
   pop de
   pop bc
   __endasm;
-
-  // ZXUNO: restauramos la velocidad nominal que hubiera
-  ZXUNODATA = d;
 }
 
 // Esta es una copia total de la rutina de la ROM 1 del 128K para enviar un byte MIDI.
@@ -1353,27 +2486,54 @@ bkm_done:
     __endasm;
 }
 
-// Posiciona el puntero de lectura del fichero en un offset absoluto desde el principio.
-// El esxdos original espera el modo de seek en IXL; el API compatible de NextZXOS lo
-// espera en L. Ponemos 0 (SEEK_START) en ambos para funcionar en los dos.
-void seekset (BYTE handle, DWORD offset) STACKARGS
+// Positions the file pointer at cur.l2end as cheaply as possible. An absolute
+// esxdos seek walks the FAT cluster chain from the FIRST cluster of the file, so
+// its cost grows with the offset — by minute 4 of a piece every burst start was a
+// felt hiccup. But the player's seeks walk the file in ascending track order, so
+// almost all of them are short hops FORWARD of the real position (sdpos): those
+// are issued as SEEK_CUR with the delta, letting esxdos continue from the cluster
+// it is already on. Only backward targets (the rotation wrapping from the last
+// track to the first, roughly once per rings-half-drained cycle) pay the absolute
+// walk. The esxdos original takes the mode in IXL; NextZXOS' compatible API takes
+// it in L — both are loaded (0 = from start, 1 = forward from current).
+void seeknext (void) __naked
 {
     __asm
     push bc
     push de
-    ld a,4(ix)  ;File handle in A
-    ld e,5(ix)
-    ld d,6(ix)
-    ld c,7(ix)
-    ld b,8(ix)  ;Offset in BCDE (B=MSB, E=LSB)
+    ld a,(#_cur + 4)    ;BCDE = cur.l2end - sdpos (the forward delta)
+    ld hl,#_sdpos
+    sub a,(hl)
+    ld e,a
+    ld a,(#_cur + 5)
+    inc hl
+    sbc a,(hl)
+    ld d,a
+    ld a,(#_cur + 6)
+    inc hl
+    sbc a,(hl)
+    ld c,a
+    ld a,(#_cur + 7)
+    inc hl
+    sbc a,(hl)
+    ld b,a              ;carry set: the target is BEHIND the current position
+    ld l,#1             ;mode 1: forward from current
+    jr nc,snx_go
+    ld de,(#_cur + 4)   ;backward: absolute seek to the target (mode 0)
+    ld bc,(#_cur + 6)
+    ld l,#0
+snx_go:
+    ld h,#0
     push ix
-    ld ix,#0    ;IXL=0: seek from start (esxdos)
-    ld l,#0     ;L=0: seek from start (NextZXOS)
+    push hl
+    pop ix              ;IXL = mode (esxdos); L = mode (NextZXOS)
+    ld a,(#_fhandle)
     rst #8
     .db #F_SEEK
     pop ix
     pop de
     pop bc
+    ret
     __endasm;
 }
 

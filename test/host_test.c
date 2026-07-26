@@ -42,6 +42,7 @@ TRKST cur;
 TRKST *curstate, *pst;
 BYTE tracks, curtrk, trkn, fired, wire_status;
 DWORD trk_next[MAX_TRACKS];
+WORD trk_steps[MAX_TRACKS];
 BYTE l2_eof[MAX_TRACKS], trk_status[MAX_TRACKS], trk_end[MAX_TRACKS];
 WORD tcsize, l2_area, rem, remt, lmask, fillb, xn;
 BYTE pick, sd_trk;
@@ -55,9 +56,8 @@ static void bankmove (WORD woff, BYTE *p, WORD n, BYTE wr)
 }
 #define L2STAGE      (buffer+0x3C)
 #define L2STAGE_SIZE 128
-DWORD os_pos;
-static void seekset (BYTE handle, DWORD offset);
-static void seekpos (DWORD off) { if (off != os_pos) { seekset(0, off); os_pos = off; } }
+DWORD sdpos;
+static unsigned long n_seeks_fwd = 0;
 BYTE tpi_frac, tfrac;
 WORD us_per_int;
 static void settempo (void)   /* mirror of the Z80 build: 16.16 ticks per frame */
@@ -77,9 +77,14 @@ static unsigned long n_seeks = 0, n_reads = 0;
 
 #define SEMIFILA8 0xFF                 /* SPACE never pressed */
 volatile BYTE int_cnt; BYTE cnt_last; BYTE im2_active;
+BYTE txlast, hltf;   /* wire batching phase-tracking: harness sends cost no time,
+                        so txlast stays 0 and the prefetch gate always passes */
 static void im2_on (void) { im2_active = 1; cnt_last = int_cnt; }
 static void im2_off (void) { im2_active = 0; }
-static void tick_guard (void) {}   /* DI-burst tick recovery: hardware-only concern */
+static void tx_flush (void) {}     /* wire batching + DI-burst tick recovery: hardware-only
+                                      concern; the harness SendMIDI prints immediately, which
+                                      matches the Z80 build's tick-level timing exactly (the
+                                      queue drains within the same frame it was filled) */
 #define WAIT_VRETRACE (sim_ints++, int_cnt++)
 
 static WORD read (BYTE handle, BYTE *buf, WORD nbytes)
@@ -89,11 +94,11 @@ static WORD read (BYTE handle, BYTE *buf, WORD nbytes)
     return (WORD)fread (buf, 1, nbytes, F);
 }
 
-static void seekset (BYTE handle, DWORD offset)
+static void seeknext (void)   /* mock: the Z80 build hops forward from sdpos when it can */
 {
-    (void)handle;
     n_seeks++;
-    fseek (F, (long)offset, SEEK_SET);
+    if (cur.l2end >= sdpos) n_seeks_fwd++;
+    fseek (F, (long)cur.l2end, SEEK_SET);
 }
 
 static void SendMIDI (BYTE *ev, BYTE lev)
@@ -139,8 +144,8 @@ int main (int argc, char **argv)
     fhandle = 0;
     playmidi1 (buffer[10] ? MAX_TRACKS : buffer[11]);
 
-    fprintf (stderr, "stats: %lu ints (%.2f s), %lu seeks, %lu reads, %u tracks, tcsize %u\n",
-             sim_ints, sim_ints * 0.02, n_seeks, n_reads, tracks, tcsize);
+    fprintf (stderr, "stats: %lu ints (%.2f s), %lu seeks (%lu fwd-relative), %lu reads, %u tracks, tcsize %u\n",
+             sim_ints, sim_ints * 0.02, n_seeks, n_seeks_fwd, n_reads, tracks, tcsize);
     fclose (F);
     return 0;
 }

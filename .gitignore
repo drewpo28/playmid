@@ -1,0 +1,27 @@
+# SDCC build artifacts (PLAYMID itself is committed; the rest regenerates)
+playmid.asm
+playmid.bin
+playmid.ihx
+playmid.lk
+playmid.lst
+playmid.map
+playmid.noi
+playmid.rel
+playmid.sym
+
+# screen/audio captures used for A/B tempo comparisons
+*.mp4
+
+# test harness: built binaries, third-party z80 core (fetch from
+# https://github.com/superzazu/z80), generated fixtures and run logs
+test/emu
+test/emu_pulse
+test/host_test
+test/z80.c
+test/z80.h
+test/__pycache__/
+test/*.mid
+test/*.ref
+test/*.out
+test/*.err
+test/*.log
