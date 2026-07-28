@@ -308,9 +308,12 @@ void l2_prefetch (void)
                            // stale base
         sd_trk = curtrk;
         sd_exit ();
+        sd_account ();     // recover any tick the call sat on (DI-holding kernels)
         return;
     }
     l2_fillstep ();        // sequential read, no seek: the shortest window
+    if (xn)                // no SD call actually happened: nothing to account
+        sd_account ();
 }
 
 // Bucle principal de reproduccion.
@@ -381,6 +384,11 @@ BYTE playmidi1 (BYTE ntrk)
     sd_trk = 0xFF;
 
     scan_tracks (ntrk);
+    // sd_account working set. Written only now: in the Z80 build est_read /
+    // est_seek live where the init overlay code (scan_tracks) sat until the
+    // call just above returned.
+    p10 = us_per_int / 10;         // the frame length in 10us spin units (the
+                                   // retroactive SD-call accounting, Z80 build)
     if (tracks == 0)
         return 1;       // el que llama imprime el error
 
@@ -442,9 +450,12 @@ BYTE playmidi1 (BYTE ntrk)
         // Un frame por vuelta: si la ISR no ha contado ninguno pendiente, dormimos.
         // Si vamos con retraso (un pasaje denso tardo mas de un frame), se procesan
         // vueltas seguidas sin dormir hasta ponerse al dia.
+        hltf = 0;                  // assume catch-up pass (frame phase unknown)
         if (cnt_last == int_cnt)
         {
             WAIT_VRETRACE;
+            hltf = 1;              // woke ON the interrupt: phase known from here
+            txlast = 0;            // wire bytes sent this frame: none yet
             tx_flush ();   // just woke ON the frame interrupt: the whole queue goes
                            // out with the next /INT a full frame away (Z80 build);
                            // this halt and queue overflow (which self-credits) are
@@ -490,8 +501,11 @@ BYTE playmidi1 (BYTE ntrk)
                 hzbusy = 1;            // its follow-up is close too
         }
 
-        // Event-less frame: the perfect slot for one prefetch step
-        if (!fired)
+        // Event-less frame: the perfect slot for one prefetch step — but only
+        // on a halt-started pass: sd_account can then measure the SD call and
+        // recover any interrupt it sat on (even under a DI-holding kernel); a
+        // step on a catch-up pass would be unaccountable (Z80 build concern)
+        if (!fired && hltf)
             l2_prefetch ();
     }
 }

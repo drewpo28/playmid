@@ -43,6 +43,15 @@ gcc -O2 -o emu emu.c z80.c
 #     the difference is the net clock drift.
 gcc -O2 -DINTT=71680 -o emu_pulse emu_pulse.c z80.c
 ./emu_pulse ../PLAYMID file.mid [max_frames] [SendMIDIByte-addr-hex] [start-with-DI]
+
+# 5c. emu_pulse also charges wall time for esxdos calls (T-states per call) and
+#     can model a kernel that holds DI through the transfer, where the /INT
+#     pulse dies invisibly to ANY handler (the MiSTer image-path case):
+EMU_READ_T=21000 EMU_SEEK_T=42000 ./emu_pulse ...            # 6ms reads, 12ms seeks
+EMU_SD_DI=1 EMU_READ_T=21000 EMU_SEEK_T=42000 ./emu_pulse ...# same, kernel holds DI
+#     EMU_WATCH_CNT=1 logs every clock credit; EMU_FILL_PC=<addr> logs each
+#     l2_fillstep entry with its frame phase. Measure in-body drift as the
+#     first-to-last-event frame span against a zero-cost run of the same build.
 ```
 
 `emu` prints one line per MIDI byte (`<frame> <hex>`) when given the

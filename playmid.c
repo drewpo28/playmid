@@ -213,6 +213,9 @@ __at (0x30DE) BYTE tpi_frac;     // fractional ticks per frame, in 256ths of a P
 __at (0x30DF) BYTE tfrac;        // accumulator for tpi_frac (carries whole units into now)
 __at (0x30E0) BYTE txlen;        // bytes queued in txbuf, waiting for the frame flush
 __at (0x30E1) BYTE txsnap;       // int_cnt snapshot taken when a flush starts (see tx_flush)
+__at (0x30E2) BYTE sdc0;         // int_cnt snapshot taken by sd_enter (see sd_account)
+__at (0x30E3) BYTE txlast;       // wire bytes sent since this frame's halt (saturating):
+                                 // ~0.39ms each, sd_account's frame-phase estimate
 __at (0x30E4) WORD spsave;       // caller SP while bankmove runs on the scratch stack
 // 0x30E6-0x30F1: bankmove scratch stack (top at 0x30F2). While a foreign bank is
 // paged at 0xC000 the caller's stack may vanish from the map, so interrupts are
@@ -224,14 +227,19 @@ __at (0x30F4) WORD lmask;        // l2_area-1: ring offsets wrap by masking (l2_
 // START of a frame, when the next /INT is a whole frame away (zx-midiplayer does
 // the same). Lives in the tail of the L1-cache area of the buffer page
 // (TCACHE_TOTAL leaves it free), always mapped while the player runs.
-#define TXBUF_CAP  76            // >= 56 (the flush credit quantum) + a channel event
+#define TXBUF_CAP  68            // >= 56 (the flush credit quantum) + a channel event
 __at (0x32F2) BYTE txbuf[TXBUF_CAP];   // 0x3202 + TCACHE_TOTAL
+// Retroactive SD-call time accounting (see sd_account): the frame period in
+// 10us units (one 35T spin iteration at 3.5MHz).
+__at (0x333A) WORD p10;          // us_per_int / 10
 // Event horizon for the SD prefetch gate (see the sweep in playmidi1 and
 // l2_prefetch): hznow = now + 2 frames of ticks, and hzbusy is set when any
 // track's next event falls inside it — an SD step taken then would audibly
 // delay those notes on slow media.
 __at (0x333E) DWORD hznow;
 __at (0x3342) BYTE hzbusy;
+__at (0x3343) BYTE hltf;         // 1 if this scheduler pass began with a real halt
+                                 // (frame phase known — see sd_account)
 __at (0x30F6) WORD us_per_int;   // frame length in us, measured at startup (see playmidi)
 __at (0x30F8) WORD fillb;        // l2_fillstep scratch: absolute bank offset to write at
 __at (0x30FA) WORD xn;           // l2_fillstep/trk_refill scratch: byte count
@@ -587,6 +595,13 @@ txf_div:
     inc b
     jr txf_div
 txf_divdone:
+    ld a,(#_txlast)          ;txlast += txlen, saturating: sd_account's estimate
+    ld hl,#_txlen            ;of how deep into the frame the wire has taken us
+    add a,(hl)
+    jr nc,txf_nosat
+    ld a,#0xFF
+txf_nosat:
+    ld (#_txlast),a
     xor a,a
     ld (#_txlen),a
     ld a,(#_int_cnt)
@@ -666,6 +681,187 @@ const BYTE sd_isr[12] = {
     0xED, 0x4D               // reti
 };
 
+// ---- Init overlay ----
+// One-shot startup code, placed in the L1-cache area of the buffer page at
+// 0x3202: everything here runs BEFORE the caches are first written (the ring
+// prefill) and the memory is then recycled under them. This trades load-image
+// bytes (the dot file grows toward 0x3400, still within the esxdos limit and
+// below the launcher-owned 0x3400+) for the packed 0x2000-0x2FFF budget.
+// Keep the overlay strictly init-time-only, and keep its end below 0x333E
+// (hznow and the other runtime globals): check l__OVL in the .map.
+// meas: see its prototype above. scan_tracks scratch: fpos lives directly in
+// cur.l2end (what the C shape copied it into before each seeknext anyway),
+// len in cur.off (the other DWORD field of the same, otherwise-idle struct).
+void ovl_holder (void) __naked
+{
+    __asm
+    .area _OVL (ABS)
+    .org 0x3202
+_scan_tracks::
+    call ___sdcc_enter_ix
+    xor a,a
+    ld (#_tracks),a
+    ld hl,#14
+    ld (#_cur+4),hl
+    ld hl,#0
+    ld (#_cur+6),hl           ; fpos = 14
+    ld hl,#_tst
+    ld (#_pst),hl             ; pst = tst
+    ld hl,#0
+    ld (#_lbytes),hl          ; lbytes = 0
+st_loop:
+    ld a,(#_tracks)
+    ld b,a
+    ld a,4(ix)
+    cp a,b
+    jp c,st_done               ; ntrk < tracks: can't happen normally, but be safe
+    jp z,st_done                ; tracks == ntrk: done
+    ld a,(#_tracks)
+    cp a,#17
+    jp nc,st_done               ; tracks >= MAX_TRACKS: done
+
+    call _seeknext             ; to cur.l2end (fpos)
+    ld hl,#8
+    push hl
+    ld hl,#_buffer
+    push hl
+    ld a,(#_fhandle)
+    push af
+    inc sp
+    call _read
+    pop af
+    pop af
+    inc sp
+    ld de,#8
+    or a
+    sbc hl,de
+    jp nz,st_done               ; read() != 8: break
+
+    ld a,(#_buffer+7)           ; len (big-endian in the file), into cur.off
+    ld (#_cur+0),a
+    ld a,(#_buffer+6)
+    ld (#_cur+1),a
+    ld a,(#_buffer+5)
+    ld (#_cur+2),a
+    ld a,(#_buffer+4)
+    ld (#_cur+3),a
+
+    ld hl,(#_cur+4)             ; fpos += 8
+    ld de,#8
+    add hl,de
+    ld (#_cur+4),hl
+    jr nc,st_fpos8done
+    ld hl,(#_cur+6)
+    inc hl
+    ld (#_cur+6),hl
+st_fpos8done:
+
+    ld hl,(#_buffer+0)          ; "MTrk"?
+    ld de,#0x544D
+    or a
+    sbc hl,de
+    jp nz,st_skip_mtrk
+    ld hl,(#_buffer+2)
+    ld de,#0x6B72
+    or a
+    sbc hl,de
+    jp nz,st_skip_mtrk
+
+    ld hl,(#_pst)
+    ld de,(#_cur+4)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld de,(#_cur+6)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl                      ; pst->off = fpos
+    ld de,(#_cur+4)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl
+    ld de,(#_cur+6)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl                      ; pst->l2end = fpos
+    ld de,(#_lbytes)
+    ld (hl),e
+    inc hl
+    ld (hl),d
+    inc hl                      ; pst->bank = lbytes
+    ld (hl),#0
+    inc hl
+    ld (hl),#0                  ; pst->cpos = pst->clen = 0
+    inc hl
+    ld (#_pst),hl               ; pst++
+
+    ld hl,(#_lbytes)
+    ld de,(#_l2_area)
+    add hl,de
+    ld (#_lbytes),hl            ; lbytes += l2_area
+
+    ld a,(#_cur+0)               ; trk_steps[tracks] = (WORD)(len>>7) + 1
+    rla                          ; carry = bit 7 of the low byte
+    ld a,(#_cur+1)
+    rla
+    ld e,a
+    ld a,(#_cur+2)
+    rla
+    ld d,a                       ; de = len >> 7 (tracks are far below 8MB)
+    inc de
+    ld a,(#_tracks)
+    ld l,a
+    ld h,#0
+    add hl,hl
+    ld bc,#_trk_steps
+    add hl,bc
+    ld (hl),e
+    inc hl
+    ld (hl),d
+
+    ld a,(#_tracks)
+    ld l,a
+    ld h,#0
+    ld bc,#_l2_eof
+    add hl,bc
+    ld (hl),#0                   ; l2_eof[tracks] = 0
+    ld a,(#_tracks)
+    ld l,a
+    ld h,#0
+    ld bc,#_trk_status
+    add hl,bc
+    ld (hl),#0                   ; trk_status[tracks] = 0
+    ld a,(#_tracks)
+    ld l,a
+    ld h,#0
+    ld bc,#_trk_end
+    add hl,bc
+    ld (hl),#0                   ; trk_end[tracks] = 0
+    ld hl,#_tracks
+    inc (hl)                     ; tracks++
+
+st_skip_mtrk:
+    ld hl,(#_cur+4)               ; fpos += len (32-bit add)
+    ld de,(#_cur+0)
+    add hl,de
+    ld (#_cur+4),hl
+    ld hl,(#_cur+6)
+    ld de,(#_cur+2)
+    adc hl,de
+    ld (#_cur+6),hl
+    jp st_loop
+st_done:
+    pop ix
+    ret
+    .area _CODE
+    __endasm;
+}
+
+
 // Builds the table/ISR/counter in bank 6. Runs once, before playback, with
 // interrupts off and NOTHING touching the stack while the bank is paged in
 // (the caller's stack may live at 0xC000-0xFFFF in the launcher's bank).
@@ -710,6 +906,8 @@ void sd_enter (void) __naked
 {
     __asm
     di
+    ld a,(#_int_cnt)
+    ld (#_sdc0),a            ; edges seen from here on belong to the SD call
     pop hl                   ; return address (the caller's stack is about to go)
     ld (#_spsave),sp
     ld a,(#23388)
@@ -746,6 +944,97 @@ void sd_exit (void) __naked
     ld (#_int_cnt),a         ; merge: the clock saw the whole esxdos call
     ei
     jp (hl)
+    __endasm;
+}
+
+// Retroactive SD-call time accounting: the bank-resident clock counts every
+// interrupt the kernel lets fire, but a kernel (or SD driver) that holds DI
+// through the transfer kills the /INT pulse at the source — no ISR anywhere
+// can see it (measured on a MiSTer image-backed setup as a steady ~1.4% drag).
+// The remedy measures the call's duration AFTER the fact. A prefetch step runs
+// on a halted, event-less frame, so the frame phase at its start is known:
+// phi ~= the flush's wire time (txlast bytes) plus a small parse fudge. After
+// the step, spin-count 35T iterations (~10us each) until int_cnt next changes
+// — on an idle frame this replaces the halt, so it costs no wall time at all.
+// From edge to edge is a whole number of frames:  phi + D + w = k*p10  exactly,
+// so with a running estimate of D (separate ones for read steps and for
+// burst-opening seeks) k is recovered, and  k - (edges actually counted)  is
+// the number of interrupts the call provably sat on: credit them to the clock.
+// The estimate then updates from the exact measurement k*p10 - phi - w, so it
+// tracks the medium's real speed within a couple of steps; it only needs to be
+// right to within half a frame for k to resolve, and it is seeded mid-range.
+void sd_account (void) __naked
+{
+    __asm
+    ld a,(#_hltf)
+    or a,a
+    ret z                    ; catch-up pass: frame phase unknown, no accounting
+    push bc
+    ld a,(#_int_cnt)         ; w-spin: 35T = ~10us per iteration, until the next
+    ld c,a                   ; visible interrupt edge (replaces the idle halt,
+    ld hl,#0                 ; so on an idle frame it costs no wall time at all)
+sda_spin:
+    inc hl                   ;(6)
+    ld a,(#_int_cnt)         ;(13)
+    cp a,c                   ;(4)
+    jr z,sda_spin            ;(12)
+    ex de,hl                 ; de = w
+    ld a,(#_txlast)          ; phi = txlast*37 + 30: the flush wire time since
+    ld l,a                   ; the halt (371us/byte) plus a small wake fudge,
+    ld h,#0                  ; both rounded DOWN — phi must never overshoot, an
+    ld c,l                   ; overshoot could turn into a false credit
+    ld b,h
+    add hl,hl
+    add hl,hl                ; *4
+    add hl,bc                ; *5
+    add hl,hl
+    add hl,hl
+    add hl,hl                ; *40
+    or a
+    sbc hl,bc
+    sbc hl,bc
+    sbc hl,bc                ; *37
+    ld bc,#30
+    add hl,bc
+    add hl,de                ; hl = phi + w
+    ; The last edge before the call, the call, the spin: edge to edge is a
+    ; whole number of frames, k*P = phi + D + w. The step is shorter than a
+    ; frame (0 <= D < P), so k = ceil((phi+w)/P) EXACTLY — no estimate needed,
+    ; and for a pathological D >= P this undercounts, never overcounts: a
+    ; false credit is impossible. Steps that sat on interrupts no ISR could
+    ; see (a kernel holding DI) show up as phi+w > P: credit the difference.
+    ld de,(#_p10)
+    ld b,#1
+sda_kloop:
+    or a
+    sbc hl,de
+    jr c,sda_kdone           ; k = ceil((phi+w)/P)
+    ld a,h
+    or a,l
+    jr z,sda_kdone
+    inc b
+    jr sda_kloop
+sda_kdone:
+    ld a,b
+    cp a,#5
+    jr nc,sda_out            ; > 4 frames: nonsense reading, do not credit
+    ld a,(#_int_cnt)
+    ld hl,#_sdc0
+    sub a,(hl)               ; edges the clock DID see (interior + spin edge)
+    ld c,a
+    ld a,b
+    sub a,c                  ; eaten inside the call, invisible to any ISR
+    jr c,sda_out
+    jr z,sda_out
+    ld c,a
+    ld a,(#_cnt_last)
+    sub a,c
+    ld (#_cnt_last),a        ; credit them: the song does not shift
+sda_out:
+    pop bc
+    xor a,a                  ; the spin consumed this frame's idle wait, ending
+    ld (#_txlast),a          ; exactly ON the new frame's edge — flush the queue
+    jp _tx_flush             ; here just like the halt path would have
     __endasm;
 }
 
@@ -1548,7 +1837,7 @@ lpf_next:
 lpf_loopdone:
     ld a,(#_c)
     inc a
-    jr z,lpf_return              ; c == 0xFF: nobody live
+    jp z,lpf_return              ; c == 0xFF: nobody live
     ld hl,(#_l2_area)            ; stickiness: while the last-read track's ring has
     ld de,#-127                  ; room for a whole step, keep serving IT (up to a
     add hl,de                    ; FULL ring) even if another ring is lower — its
@@ -1568,7 +1857,7 @@ lpf_worst:
     ld hl,(#_xn)
     or a
     sbc hl,de                    ; hl = xn - (l2_area>>1)
-    jr nc,lpf_return              ; xn >= threshold: all above the low watermark
+    jp nc,lpf_return              ; xn >= threshold: all above the low watermark
     ld hl,(#_xn)
 lpf_gate:                        ; HL = the chosen ring's remaining bytes
     ld a,(#_hzbusy)              ; an event is due within ~2 frames: blocking on
@@ -1601,9 +1890,14 @@ lpf_go:
     ld a,(#_curtrk)
     ld (#_sd_trk),a
     call _sd_exit
-    ret
+    jp _sd_account           ; recover any tick the call sat on (DI-holding kernels)
 lpf_fill:
     call _l2_fillstep        ; sequential read, no seek: the shortest window
+    ld hl,(#_xn)
+    ld a,h
+    or a,l
+    ret z                    ; no SD call actually happened: nothing to account
+    jp _sd_account
 lpf_return:
     ret
     __endasm;
@@ -1614,170 +1908,7 @@ lpf_return:
 // Devuelve 0 si se ha reproducido, 1 si no se encontro ninguna pista MTrk.
 // Recorre los chunks del fichero construyendo la tabla de offsets de comienzo de
 // cada pista. La longitud de cada chunk está en su cabecera.
-void scan_tracks (BYTE ntrk) STACKARGS
-{
-    // Scratch: fpos lives directly in cur.l2end (exactly what the C version
-    // copied it into before each seeknext anyway), len in cur.off (the other
-    // DWORD field of the same, otherwise-idle scratch struct).
-    __asm
-    xor a,a
-    ld (#_tracks),a
-    ld hl,#14
-    ld (#_cur+4),hl
-    ld hl,#0
-    ld (#_cur+6),hl           ; fpos = 14
-    ld hl,#_tst
-    ld (#_pst),hl             ; pst = tst
-    ld hl,#0
-    ld (#_lbytes),hl          ; lbytes = 0
-st_loop:
-    ld a,(#_tracks)
-    ld b,a
-    ld a,4(ix)
-    cp a,b
-    jp c,st_done               ; ntrk < tracks: can't happen normally, but be safe
-    jp z,st_done                ; tracks == ntrk: done
-    ld a,(#_tracks)
-    cp a,#17
-    jp nc,st_done               ; tracks >= MAX_TRACKS: done
-
-    call _seeknext             ; to cur.l2end (fpos)
-    ld hl,#8
-    push hl
-    ld hl,#_buffer
-    push hl
-    ld a,(#_fhandle)
-    push af
-    inc sp
-    call _read
-    pop af
-    pop af
-    inc sp
-    ld de,#8
-    or a
-    sbc hl,de
-    jp nz,st_done               ; read() != 8: break
-
-    ld a,(#_buffer+7)           ; len (big-endian in the file), into cur.off
-    ld (#_cur+0),a
-    ld a,(#_buffer+6)
-    ld (#_cur+1),a
-    ld a,(#_buffer+5)
-    ld (#_cur+2),a
-    ld a,(#_buffer+4)
-    ld (#_cur+3),a
-
-    ld hl,(#_cur+4)             ; fpos += 8
-    ld de,#8
-    add hl,de
-    ld (#_cur+4),hl
-    jr nc,st_fpos8done
-    ld hl,(#_cur+6)
-    inc hl
-    ld (#_cur+6),hl
-st_fpos8done:
-
-    ld hl,(#_buffer+0)          ; "MTrk"?
-    ld de,#0x544D
-    or a
-    sbc hl,de
-    jp nz,st_skip_mtrk
-    ld hl,(#_buffer+2)
-    ld de,#0x6B72
-    or a
-    sbc hl,de
-    jp nz,st_skip_mtrk
-
-    ld hl,(#_pst)
-    ld de,(#_cur+4)
-    ld (hl),e
-    inc hl
-    ld (hl),d
-    inc hl
-    ld de,(#_cur+6)
-    ld (hl),e
-    inc hl
-    ld (hl),d
-    inc hl                      ; pst->off = fpos
-    ld de,(#_cur+4)
-    ld (hl),e
-    inc hl
-    ld (hl),d
-    inc hl
-    ld de,(#_cur+6)
-    ld (hl),e
-    inc hl
-    ld (hl),d
-    inc hl                      ; pst->l2end = fpos
-    ld de,(#_lbytes)
-    ld (hl),e
-    inc hl
-    ld (hl),d
-    inc hl                      ; pst->bank = lbytes
-    ld (hl),#0
-    inc hl
-    ld (hl),#0                  ; pst->cpos = pst->clen = 0
-    inc hl
-    ld (#_pst),hl               ; pst++
-
-    ld hl,(#_lbytes)
-    ld de,(#_l2_area)
-    add hl,de
-    ld (#_lbytes),hl            ; lbytes += l2_area
-
-    ld a,(#_cur+0)               ; trk_steps[tracks] = (WORD)(len>>7) + 1
-    rla                          ; carry = bit 7 of the low byte
-    ld a,(#_cur+1)
-    rla
-    ld e,a
-    ld a,(#_cur+2)
-    rla
-    ld d,a                       ; de = len >> 7 (tracks are far below 8MB)
-    inc de
-    ld a,(#_tracks)
-    ld l,a
-    ld h,#0
-    add hl,hl
-    ld bc,#_trk_steps
-    add hl,bc
-    ld (hl),e
-    inc hl
-    ld (hl),d
-
-    ld a,(#_tracks)
-    ld l,a
-    ld h,#0
-    ld bc,#_l2_eof
-    add hl,bc
-    ld (hl),#0                   ; l2_eof[tracks] = 0
-    ld a,(#_tracks)
-    ld l,a
-    ld h,#0
-    ld bc,#_trk_status
-    add hl,bc
-    ld (hl),#0                   ; trk_status[tracks] = 0
-    ld a,(#_tracks)
-    ld l,a
-    ld h,#0
-    ld bc,#_trk_end
-    add hl,bc
-    ld (hl),#0                   ; trk_end[tracks] = 0
-    ld hl,#_tracks
-    inc (hl)                     ; tracks++
-
-st_skip_mtrk:
-    ld hl,(#_cur+4)               ; fpos += len (32-bit add)
-    ld de,(#_cur+0)
-    add hl,de
-    ld (#_cur+4),hl
-    ld hl,(#_cur+6)
-    ld de,(#_cur+2)
-    adc hl,de
-    ld (#_cur+6),hl
-    jp st_loop
-st_done:
-    __endasm;
-}
+void scan_tracks (BYTE ntrk) STACKARGS;   // in the init overlay at 0x3202 (ovl_holder)
 
 BYTE playmidi1 (BYTE ntrk) STACKARGS
 {
@@ -1823,6 +1954,19 @@ pm1_ovdone:
     inc sp
     call _scan_tracks
     inc sp
+
+    ; sd_account working set: the frame length for the retroactive SD timing.
+    ld hl,(#_us_per_int)     ; p10 = us_per_int/10: the frame in 10us spin units
+    ld de,#10
+    ld bc,#0
+pm1_p10loop:
+    or a
+    sbc hl,de
+    jr c,pm1_p10done
+    inc bc
+    jr pm1_p10loop
+pm1_p10done:
+    ld (#_p10),bc
 
     ld a,(#_tracks)
     or a,a
@@ -1957,11 +2101,17 @@ pm1_mainloop:
     ld l,#0
     jp pm1_epilogue
 pm1_no_space:
+    xor a,a
+    ld (#_hltf),a            ;assume catch-up pass (frame phase unknown)
     ld a,(#_cnt_last)
     ld hl,#_int_cnt
     cp a,(hl)
     jr nz,pm1_skip_halt
     halt
+    ld a,#1                  ;woke ON the interrupt: phase is known from here on
+    ld (#_hltf),a
+    xor a,a
+    ld (#_txlast),a          ;wire bytes sent this frame: none yet
     call _tx_flush           ;just woke ON the frame interrupt: the whole queue goes
                              ;out with the next /INT a full frame away. Any other
                              ;moment in the frame is a guess — a long sweep can end
@@ -2143,7 +2293,10 @@ pm1_sched_done:
     ld a,(#_fired)
     or a,a
     jr nz,pm1_loop_end
-    call _l2_prefetch
+    ld a,(#_hltf)            ;only take an SD step when the pass began with a
+    or a,a                   ;halt: sd_account can then measure the call and
+    jr z,pm1_loop_end        ;recover anything it sat on — a step taken on a
+    call _l2_prefetch        ;catch-up pass would be unaccountable
 pm1_loop_end:
     jp pm1_mainloop
 pm1_epilogue:
@@ -2247,7 +2400,8 @@ void SendMIDI (BYTE *ev, BYTE lev) STACKARGS
   jr nc,smq_flush          ;frame of wire, so its credit accounting is exact —
                            ;flushing now keeps every overflow window that tight
   add a,6(ix)              ;txlen + lev
-  cp a,#(80+1)             ;TXBUF_CAP
+  cp a,#(68+1)             ;TXBUF_CAP (keep in sync!): past it the queue would
+                           ;overrun into the est_*/hznow globals right after it
   jr c,smq_room
 smq_flush:
   call _tx_flush           ;drain what is queued first

@@ -40,8 +40,16 @@ static uint8_t *maddr(uint16_t a) {
 #define RD(a) (*maddr((uint16_t)(a)))
 static uint8_t rb(void *ud, uint16_t a) { (void)ud; return RD(a); }
 static unsigned long canary_writes = 0;
+static unsigned long cnt_credits = 0;
 static void wb(void *ud, uint16_t a, uint8_t v) {
     (void)ud;
+    if (a == 0x30FD && getenv("EMU_WATCH_CNT")) {
+        uint8_t old = *maddr(a);
+        if ((uint8_t)(old - v) < 8 && old != v) {   /* a decrease = a credit */
+            cnt_credits += (uint8_t)(old - v);
+            fprintf(stderr, "[credit] frame %lu: cnt_last %u -> %u\n", frames, old, v);
+        }
+    }
     if (((a >= 0x3400 && a <= 0x3FFF) || (a >= 0x4000 && a <= 0x5AFF)) && canary_writes++ < 8)
         fprintf(stderr, "[CANARY] write %02X to %04X (cpu)\n", v, a);
     if (a >= 0xC000 && (curbank == 5 || curbank == 7 || curbank == 2) && canary_writes++ < 8)
@@ -202,14 +210,38 @@ int main (int argc, char **argv)
                esxdos calls, so /INTs falling inside are counted by nobody —
                exactly the loss mode that streams >64KB files drag from. */
             {
-                static long read_t = -1, seek_t = -1;
+                static long read_t = -1, seek_t = -1, sd_di = 0;
                 if (read_t < 0) {
                     const char *r = getenv("EMU_READ_T"), *s = getenv("EMU_SEEK_T");
                     read_t = r ? atol(r) : 0;
                     seek_t = s ? atol(s) : 0;
+                    sd_di = getenv("EMU_SD_DI") ? atol(getenv("EMU_SD_DI")) : 0;
                 }
                 if (call == F_READ) z.cyc += read_t;
                 if (call == F_SEEK) z.cyc += seek_t;
+                /* walk the frame grid THROUGH the charged time (an atomic cyc
+                   jump would bunch the interrupts after the call and skew any
+                   in-player time measurement):
+                   - EMU_SD_DI=1: the kernel holds DI through the transfer —
+                     the /INT pulses die at the source, invisible to ANY
+                     handler (the worst real case, seen on the MiSTer image path)
+                   - otherwise, with the player's bank-6 clock mounted
+                     (curbank==6), each interrupt ticks the bank-side counter
+                     exactly like the real ISR would */
+                while (z.cyc - last_int > INTT) {
+                    last_int += INTT;
+                    frames++;
+                    if (++mem[23672] == 0 && ++mem[23673] == 0) ++mem[23674];
+                    if (sd_di) {
+                        lost_ints++;
+                        fprintf(stderr, "[di-int] frame %lu\n", frames);
+                    } else if (curbank == 6) {
+                        banks[6][0x3D7E]++;   /* the bank-resident ISR's counter */
+                    } else {
+                        lost_ints++;          /* no clock mounted: lost outright */
+                        fprintf(stderr, "[im1-lost] frame %lu\n", frames);
+                    }
+                }
             }
             z.pc = ret + 1;
             continue;

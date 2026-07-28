@@ -48,6 +48,8 @@ WORD tcsize, l2_area, rem, remt, lmask, fillb, xn;
 BYTE pick, sd_trk;
 DWORD now;
 DWORD hznow; BYTE hzbusy;    /* SD-prefetch event horizon (see the engine sweep) */
+BYTE hltf, txlast;           /* frame-phase tracking for sd_account (Z80 build) */
+WORD p10;
 DWORD *pnext;
 BYTE *rdptr, *rdend, *cptr;
 static BYTE banks64[65536];
@@ -85,6 +87,7 @@ static void im2_off (void) { im2_active = 0; }
 static void sd_im2_init (void) {}
 static void sd_enter (void) {}
 static void sd_exit (void) {}
+static void sd_account (void) {}   /* retroactive SD-call timing: hardware-only */
 static void tx_flush (void) {}     /* wire batching + DI-burst tick recovery: hardware-only
                                       concern; the harness SendMIDI prints immediately, which
                                       matches the Z80 build's tick-level timing exactly (the
