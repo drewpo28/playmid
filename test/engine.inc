@@ -283,13 +283,34 @@ void l2_prefetch (void)
     // (both hover just under the half watermark); long bursts amortize one seek
     // over ~16 steps.
     if (rem < l2_area - 127)
+    {
         c = sd_trk;
+        xn = rem;
+    }
     else if (xn >= (l2_area >> 1))            // all above the low watermark
         return;
+    // An event is due within ~2 frames: blocking on the SD now would audibly
+    // delay it, so defer to a quieter frame — unless the chosen ring is nearly
+    // dry (below a quarter), where a scheduled stall now beats an unscheduled
+    // one at zero.
+    if (hzbusy && xn >= (l2_area >> 2))
+        return;
     set_curtrk (c);
-    l2_fillstep ();    // seek (if the burst is opening) and read in one step: the
-                       // bank-resident clock ticks through both, so a long window
-                       // only delays this one step, never the song
+    if (sd_trk != curtrk)
+    {
+        // Opening a new burst? The FAT-walk seek gets a frame of its own:
+        // seek+read back to back is the longest blocking window there is, and
+        // split apart each half delays the music half as much.
+        sd_enter ();
+        seeknext ();       // to cur.l2end
+        sdpos = cur.l2end; // the pointer moved with no read to account for it:
+                           // track it, or the next relative seek hops from a
+                           // stale base
+        sd_trk = curtrk;
+        sd_exit ();
+        return;
+    }
+    l2_fillstep ();        // sequential read, no seek: the shortest window
 }
 
 // Bucle principal de reproduccion.
@@ -435,12 +456,21 @@ BYTE playmidi1 (BYTE ntrk)
         if (tfrac < tpi_frac)      // ...8-bit wrap = a whole PRECISION unit: carry it
             now++;
 
+        // hznow = now + 2 frames of ticks: the sweep marks hzbusy when any
+        // track's next event falls inside — an SD step taken then would audibly
+        // delay those notes on slow media (see l2_prefetch)
+        hznow = now + (ticks_per_int << 1);
+        hzbusy = 0;
         fired = 0;
         pnext = trk_next;
         for (trkn = 0; trkn < tracks; trkn++, pnext++)
         {
             if (*pnext > now)          // aun no le toca (el centinela de pista
-                continue;              // terminada, 0xFFFFFFFF, nunca "toca")
+            {                          // terminada, 0xFFFFFFFF, nunca "toca")
+                if (*pnext <= hznow)
+                    hzbusy = 1;        // not due yet, but due inside the horizon
+                continue;
+            }
             fired = 1;
             set_curtrk (trkn);
             do
@@ -456,6 +486,8 @@ BYTE playmidi1 (BYTE ntrk)
                 *pnext += trk_varlen() << 6;    // <<6 == * PRECISION
             }
             while (*pnext <= now);
+            if (*pnext <= hznow)
+                hzbusy = 1;            // its follow-up is close too
         }
 
         // Event-less frame: the perfect slot for one prefetch step

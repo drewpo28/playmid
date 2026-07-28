@@ -17,7 +17,7 @@ typedef uint32_t DWORD;
 
 #define PRECISION 64
 #define MAX_TRACKS   17
-#define TCACHE_TOTAL 356
+#define TCACHE_TOTAL 240
 
 /* globals shared with the engine (declared in playmid.c outside the markers) */
 BYTE i, c;
@@ -47,6 +47,7 @@ BYTE l2_eof[MAX_TRACKS], trk_status[MAX_TRACKS], trk_end[MAX_TRACKS];
 WORD tcsize, l2_area, rem, remt, lmask, fillb, xn;
 BYTE pick, sd_trk;
 DWORD now;
+DWORD hznow; BYTE hzbusy;    /* SD-prefetch event horizon (see the engine sweep) */
 DWORD *pnext;
 BYTE *rdptr, *rdend, *cptr;
 static BYTE banks64[65536];

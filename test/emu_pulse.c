@@ -261,7 +261,8 @@ int main (int argc, char **argv)
             fprintf(stderr, "[lost-int] frame %lu pc=%04X\n", frames, z.pc);
         }
         if (z.cyc - last_int > INTT) {         /* one video frame */
-            last_int = z.cyc;
+            last_int += INTT;                  /* rigid grid: charged SD time may
+                                                  span several frames — each fires */
             frames++;
             /* ROM ISR increments FRAMES (23672, 3 bytes) */
             if (++mem[23672] == 0 && ++mem[23673] == 0) ++mem[23674];

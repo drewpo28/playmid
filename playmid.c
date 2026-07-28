@@ -21,7 +21,7 @@ Compilar con SDCC 4.x, con la convencion de llamada por defecto (NO usar --sdccc
 z80.lib viene compilada con la convencion por registros y las rutinas de multiplicacion/division
 recibirian basura; las funciones con ensamblador incrustado ya van marcadas con __sdcccall(0)):
 sdcc -mz80 --reserve-regs-iy --opt-code-size --max-allocs-per-node 100000 \
---nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2eb0 playmid.c z80.lib -L /path/to/sdcc/lib/z80
+--nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2eba playmid.c z80.lib -L /path/to/sdcc/lib/z80
 makebin -s 65535 -p playmid.ihx playmid.bin
 dd if=playmid.bin of=PLAYMID bs=1 skip=8192
 
@@ -140,7 +140,8 @@ __at(0x3000) BYTE buffer[1024];  // Staging para la cabecera y los eventos MIDI 
 //   0x3202-0x3343  cachés de lectura L1 de las pistas
 //   0x3344-0x33FF  more globals (see below)
 #define MAX_TRACKS   17                   // pista de tempo + 16 canales: el maximo de un format 1 tipico
-#define TCACHE_TOTAL 322                  // bytes de buffer disponibles para cachés L1
+#define TCACHE_TOTAL 240                  // bytes de buffer disponibles para cachés L1 (la cola
+                                          // de la zona de cachés la ocupan txbuf y el horizonte)
 #define tcaches      (buffer+0x202)       // las cachés van tras la tabla de vectores IM2
 #define L2STAGE      (buffer+0x3C)        // staging de recargas L2 (hueco tras la ISR)
 #define L2STAGE_SIZE 128                  // power of 2: keeps the ring fill position aligned
@@ -221,12 +222,16 @@ __at (0x30F4) WORD lmask;        // l2_area-1: ring offsets wrap by masking (l2_
 // TX queue: events are not sent the moment they are parsed but queued here and
 // flushed in one burst right after the frame's event sweep, i.e. always near the
 // START of a frame, when the next /INT is a whole frame away (zx-midiplayer does
-// the same). Lives in the padding hole between the end of _CODE and _DATA at
-// 0x2EB0 — after any code change, check in the .map that _CODE still ends below
-// TXBUF_BASE.
-#define TXBUF_BASE 0x2E60
-#define TXBUF_CAP  80            // <= 0x2EB0 - TXBUF_BASE; >= 48 (a sysex chunk) + a channel event
-__at (TXBUF_BASE) BYTE txbuf[TXBUF_CAP];
+// the same). Lives in the tail of the L1-cache area of the buffer page
+// (TCACHE_TOTAL leaves it free), always mapped while the player runs.
+#define TXBUF_CAP  76            // >= 56 (the flush credit quantum) + a channel event
+__at (0x32F2) BYTE txbuf[TXBUF_CAP];   // 0x3202 + TCACHE_TOTAL
+// Event horizon for the SD prefetch gate (see the sweep in playmidi1 and
+// l2_prefetch): hznow = now + 2 frames of ticks, and hzbusy is set when any
+// track's next event falls inside it — an SD step taken then would audibly
+// delay those notes on slow media.
+__at (0x333E) DWORD hznow;
+__at (0x3342) BYTE hzbusy;
 __at (0x30F6) WORD us_per_int;   // frame length in us, measured at startup (see playmidi)
 __at (0x30F8) WORD fillb;        // l2_fillstep scratch: absolute bank offset to write at
 __at (0x30FA) WORD xn;           // l2_fillstep/trk_refill scratch: byte count
@@ -1554,7 +1559,8 @@ lpf_loopdone:
     jr nc,lpf_worst              ; long bursts amortize one seek over ~16 steps.
     ld a,(#_sd_trk)
     ld (#_c),a
-    jr lpf_go
+    ld hl,(#_rem)
+    jr lpf_gate
 lpf_worst:
     ld de,(#_l2_area)
     srl d
@@ -1562,17 +1568,42 @@ lpf_worst:
     ld hl,(#_xn)
     or a
     sbc hl,de                    ; hl = xn - (l2_area>>1)
-    jr c,lpf_go                   ; xn < threshold: worth a step
-    jr lpf_return                  ; xn >= threshold: all above the low watermark
+    jr nc,lpf_return              ; xn >= threshold: all above the low watermark
+    ld hl,(#_xn)
+lpf_gate:                        ; HL = the chosen ring's remaining bytes
+    ld a,(#_hzbusy)              ; an event is due within ~2 frames: blocking on
+    or a,a                       ; the SD now would audibly delay it, so defer to
+    jr z,lpf_go                  ; a quieter frame — unless the ring is nearly
+    ld de,(#_l2_area)            ; dry (below a quarter), where a scheduled stall
+    srl d                        ; now beats an unscheduled one at zero
+    rr e
+    srl d
+    rr e                          ; de = l2_area >> 2
+    or a
+    sbc hl,de
+    jr nc,lpf_return
 lpf_go:
     ld a,(#_c)
     push af
     inc sp
     call _set_curtrk
     inc sp                   ; only 1 net byte was pushed for this single BYTE arg
-    call _l2_fillstep        ; seek (if the burst is opening) and read in one step:
-                             ; the bank-resident clock ticks through both, so a
-                             ; long window only delays this one step, never the song
+    ld a,(#_sd_trk)          ; opening a new burst? the FAT-walk seek gets a frame
+    ld hl,#_curtrk           ; of its own: seek+read back to back is the longest
+    cp a,(hl)                ; blocking window there is, and split apart each half
+    jr z,lpf_fill            ; delays the music half as much
+    call _sd_enter
+    call _seeknext           ; to cur.l2end
+    ld hl,(#_cur+4)          ; the file pointer moved with no read to account for
+    ld (#_sdpos),hl          ; it: track it, or the next relative seek would hop
+    ld hl,(#_cur+6)          ; from a stale base
+    ld (#_sdpos+2),hl
+    ld a,(#_curtrk)
+    ld (#_sd_trk),a
+    call _sd_exit
+    ret
+lpf_fill:
+    call _l2_fillstep        ; sequential read, no seek: the shortest window
 lpf_return:
     ret
     __endasm;
@@ -1772,19 +1803,13 @@ pm1_szloop:
     ld (#_i),a
     jr pm1_szloop
 pm1_szdone:
-    ld a,4(ix)               ; the bank-side IM2 clock lives in the top ~900 bytes
-    ld b,a                   ; of bank 6: when the rings would fill all 64KB
-    ld hl,#0                 ; (track count a power of two), halve the ring size
-    ld de,(#_l2_area)        ; so the allocator never reaches it
-pm1_ovloop:
-    add hl,de
-    jr c,pm1_ovhalve
-    djnz pm1_ovloop
-    jr pm1_ovdone
-pm1_ovhalve:
-    srl d
-    rr e
-    ld (#_l2_area),de
+    ld a,(#_i)               ; the bank-side IM2 clock lives in the top ~900 bytes
+    cp a,4(ix)               ; of bank 6: the rings would fill all 64KB exactly
+    jr nz,pm1_ovdone         ; when the sizing loop stopped at i == ntrk (a
+    ld hl,(#_l2_area)        ; power-of-two track count) — halve the ring size
+    srl h                    ; so the allocator never reaches the reserved tail
+    rr l
+    ld (#_l2_area),hl
 pm1_ovdone:
     call _sd_im2_init        ; build the bank-side vector table/ISR/counter
     ld hl,(#_l2_area)
@@ -1808,7 +1833,7 @@ pm1_trackscheck_ok:
 
     ld hl,#0
     ld (#_tcsize),hl
-    ld hl,#322
+    ld hl,#240               ; TCACHE_TOTAL
     ld (#_remt),hl
 pm1_tcloop:
     ld hl,(#_remt)
@@ -1970,7 +1995,19 @@ pm1_skip_halt:
     ld (#_now+2),hl
 pm1_no_carry_now:
 
+    ld hl,(#_ticks_per_int)  ;hznow = now + 2 frames of ticks: the sweep below
+    ld de,(#_ticks_per_int+2);marks hzbusy when any track's next event falls
+    add hl,hl                ;inside — an SD step taken then would audibly delay
+    rl e                     ;those notes on slow media (see l2_prefetch)
+    rl d
+    ld bc,(#_now)
+    add hl,bc
+    ld (#_hznow),hl
+    ld hl,(#_now+2)
+    adc hl,de
+    ld (#_hznow+2),hl
     xor a,a
+    ld (#_hzbusy),a
     ld (#_fired),a
     ld hl,#_trk_next
     ld (#_pnext),hl
@@ -2082,6 +2119,19 @@ pm1_fire_shift:
     jp c,pm1_sched_next
     jp pm1_fire_loop
 pm1_sched_next:
+    ld hl,(#_hznow+2)        ;not due this frame, but due inside the horizon?
+    or a                     ;(BC:DE still hold this track's next-event tick)
+    sbc hl,bc
+    jr c,pm1_hz_far          ;hz_high < next_high: well beyond the horizon
+    jr nz,pm1_hz_near        ;hz_high > next_high: inside
+    ld hl,(#_hznow)
+    or a
+    sbc hl,de
+    jr c,pm1_hz_far
+pm1_hz_near:
+    ld a,#1
+    ld (#_hzbusy),a
+pm1_hz_far:
     ld hl,(#_pnext)
     ld de,#4
     add hl,de
