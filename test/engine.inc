@@ -73,16 +73,16 @@ void l2_fillstep (void)
     fillb = cur.bank + remt;
     if ((fillb ^ cur.bank) & ~lmask)
         fillb -= l2_area;
-    im2_off ();        // esxdos must run in the bone-stock interrupt state
+    sd_enter ();       // esxdos runs with the bank-resident IM2 clock ticking
     if (sd_trk != curtrk)
     {
         seeknext ();   // to cur.l2end: a cheap forward hop from sdpos when possible
         sd_trk = curtrk;
     }
     xn = read (fhandle, L2STAGE, L2STAGE_SIZE);
-    im2_on ();         // esxdos is done: remount the clock BEFORE the ring bankmove
-                       // (it is interrupt-safe) — every us of this window loses any
-                       // /INT that falls in it
+    sd_exit ();        // esxdos done: merge the interrupts it sat on into int_cnt.
+                       // The ring bankmove below runs on the normal clock (it is
+                       // interrupt-safe)
     if (xn == 0xFFFF)
         xn = 0;
     if (xn)
@@ -287,21 +287,9 @@ void l2_prefetch (void)
     else if (xn >= (l2_area >> 1))            // all above the low watermark
         return;
     set_curtrk (c);
-    if (sd_trk != curtrk)
-    {
-        // Opening a new burst? Split the FAT-walk seek into its own frame:
-        // seek+read back to back can outlast the frame even from an early phase,
-        // and the read follows on the next idle frame with no seek at all.
-        im2_off ();
-        seeknext ();       // to cur.l2end
-        sdpos = cur.l2end; // the pointer moved with no read to account for it:
-                           // track it, or the next relative seek hops from a
-                           // stale base
-        sd_trk = curtrk;
-        im2_on ();
-        return;
-    }
-    l2_fillstep ();
+    l2_fillstep ();    // seek (if the burst is opening) and read in one step: the
+                       // bank-resident clock ticks through both, so a long window
+                       // only delays this one step, never the song
 }
 
 // Bucle principal de reproduccion.
@@ -362,6 +350,12 @@ BYTE playmidi1 (BYTE ntrk)
     l2_area = 0x8000;                      // 1-2 tracks: two 32KB halves
     for (i = 2; i && i < ntrk; i <<= 1)
         l2_area >>= 1;
+    // The bank-side IM2 clock lives in the top ~900 bytes of bank 6: when the
+    // rings would fill all 64KB (track count a power of two), halve the ring
+    // size so the allocator never reaches it.
+    if ((DWORD)l2_area * ntrk > 0xFFFF)
+        l2_area >>= 1;
+    sd_im2_init ();                        // build the bank-side vector table/ISR
     lmask = l2_area - 1;
     sd_trk = 0xFF;
 
@@ -427,12 +421,9 @@ BYTE playmidi1 (BYTE ntrk)
         // Un frame por vuelta: si la ISR no ha contado ninguno pendiente, dormimos.
         // Si vamos con retraso (un pasaje denso tardo mas de un frame), se procesan
         // vueltas seguidas sin dormir hasta ponerse al dia.
-        hltf = 0;                  // assume catch-up pass (frame phase unknown)
         if (cnt_last == int_cnt)
         {
             WAIT_VRETRACE;
-            hltf = 1;              // woke ON the interrupt: phase known from here on
-            txlast = 0;            // wire bytes sent this frame: none yet
             tx_flush ();   // just woke ON the frame interrupt: the whole queue goes
                            // out with the next /INT a full frame away (Z80 build);
                            // this halt and queue overflow (which self-credits) are
@@ -467,13 +458,8 @@ BYTE playmidi1 (BYTE ntrk)
             while (*pnext <= now);
         }
 
-        // Event-less frame: the perfect slot for one prefetch step — but only
-        // when the frame phase is provably early (the pass began with a halt and
-        // at most 8 wire bytes ~ 3ms have gone out since, so even a slow ~12ms SD
-        // step still fits the frame): the step dismounts the IM2 clock for a few
-        // ms and every /INT inside is silently lost. Skipped steps just wait for
-        // the next quiet frame.
-        if (!fired && hltf && txlast <= 8)
+        // Event-less frame: the perfect slot for one prefetch step
+        if (!fired)
             l2_prefetch ();
     }
 }

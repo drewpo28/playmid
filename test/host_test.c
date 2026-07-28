@@ -77,10 +77,13 @@ static unsigned long n_seeks = 0, n_reads = 0;
 
 #define SEMIFILA8 0xFF                 /* SPACE never pressed */
 volatile BYTE int_cnt; BYTE cnt_last; BYTE im2_active;
-BYTE txlast, hltf;   /* wire batching phase-tracking: harness sends cost no time,
-                        so txlast stays 0 and the prefetch gate always passes */
 static void im2_on (void) { im2_active = 1; cnt_last = int_cnt; }
 static void im2_off (void) { im2_active = 0; }
+/* bank-resident IM2 clock across esxdos calls: hardware-only concern — harness
+   reads cost no simulated time, so no interrupts can fall inside them */
+static void sd_im2_init (void) {}
+static void sd_enter (void) {}
+static void sd_exit (void) {}
 static void tx_flush (void) {}     /* wire batching + DI-burst tick recovery: hardware-only
                                       concern; the harness SendMIDI prints immediately, which
                                       matches the Z80 build's tick-level timing exactly (the

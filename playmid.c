@@ -212,12 +212,6 @@ __at (0x30DE) BYTE tpi_frac;     // fractional ticks per frame, in 256ths of a P
 __at (0x30DF) BYTE tfrac;        // accumulator for tpi_frac (carries whole units into now)
 __at (0x30E0) BYTE txlen;        // bytes queued in txbuf, waiting for the frame flush
 __at (0x30E1) BYTE txsnap;       // int_cnt snapshot taken when a flush starts (see tx_flush)
-__at (0x30E2) BYTE txlast;       // wire bytes sent since this frame's halt (saturating):
-                                 // ~0.39ms each, it estimates how deep into the frame we
-                                 // are — the SD prefetch step is skipped when the phase
-                                 // is no longer provably far from the next /INT
-__at (0x30E3) BYTE hltf;         // 1 if this scheduler pass started with a real halt
-                                 // (frame phase known), 0 on catch-up passes
 __at (0x30E4) WORD spsave;       // caller SP while bankmove runs on the scratch stack
 // 0x30E6-0x30F1: bankmove scratch stack (top at 0x30F2). While a foreign bank is
 // paged at 0xC000 the caller's stack may vanish from the map, so interrupts are
@@ -588,13 +582,6 @@ txf_div:
     inc b
     jr txf_div
 txf_divdone:
-    ld a,(#_txlast)          ;txlast += txlen, saturating at 255: frame-phase estimate
-    ld hl,#_txlen
-    add a,(hl)
-    jr nc,txf_nosat
-    ld a,#0xFF
-txf_nosat:
-    ld (#_txlast),a
     xor a,a
     ld (#_txlen),a
     ld a,(#_int_cnt)
@@ -642,6 +629,118 @@ void im2_off (void) __naked
     ld i,a
     ei
     ret
+    __endasm;
+}
+
+// ---- Bank-resident IM2 clock for esxdos calls ----
+// Switching to IM1 around SD accesses keeps the kernel happy but blinds the
+// clock: every /INT falling inside the call is silently lost (the EPROM's 0x38
+// handler counts nothing), and on real hardware an esxdos 128-byte read or a
+// FAT-walk seek takes long enough to eat one nearly every time — measured on a
+// MiSTer as ~1.5% tempo drag. But the kernel only ever remaps 0x0000-0x3FFF;
+// main RAM and the 128K paging port are untouched. So a SECOND vector table,
+// ISR and counter live in the top of bank 6 (space the ring allocator never
+// hands out), and around each esxdos call the player pins bank 6 at 0xC000,
+// points I at that table and moves SP into it (the caller's stack may live in
+// the paged-out bank, and the kernel inherits our SP). Interrupts stay in IM2
+// through the whole call, ticking the bank-side counter, which is merged into
+// int_cnt on exit: the clock no longer misses SD time at all, on any card.
+// Layout in bank 6 (CPU addresses while paged at 0xC000):
+//   0xFC80-0xFD6F  stack for the esxdos call (top at 0xFD70)
+//   0xFD7E         interrupt counter (merged into int_cnt by sd_exit)
+//   0xFD80-0xFD8B  ISR: inc the counter, ei, reti
+//   0xFDFD-0xFDFF  jp 0xFD80 (the vector 0xFDFD lands here)
+//   0xFE00-0xFF00  257-byte vector table, all 0xFD (I=0xFE, any bus byte)
+const BYTE sd_isr[12] = {
+    0xF5,                    // push af
+    0x3A, 0x7E, 0xFD,        // ld a,(0xFD7E)
+    0x3C,                    // inc a
+    0x32, 0x7E, 0xFD,        // ld (0xFD7E),a
+    0xF1,                    // pop af
+    0xFB,                    // ei
+    0xED, 0x4D               // reti
+};
+
+// Builds the table/ISR/counter in bank 6. Runs once, before playback, with
+// interrupts off and NOTHING touching the stack while the bank is paged in
+// (the caller's stack may live at 0xC000-0xFFFF in the launcher's bank).
+void sd_im2_init (void) __naked
+{
+    __asm
+    di
+    ld a,(#23388)
+    and a,#0xF8
+    or a,#6
+    ld bc,#0x7ffd
+    out (c),a                ; bank 6 in: straight-line code only from here
+    ld hl,#0xFE00            ; vector table: 257 bytes of 0xFD
+    ld de,#0xFE01
+    ld bc,#256
+    ld (hl),#0xFD
+    ldir
+    ld hl,#_sd_isr           ; the ISR body
+    ld de,#0xFD80
+    ld bc,#12
+    ldir
+    ld hl,#0xFDFD            ; the landing vector: jp 0xFD80
+    ld (hl),#0xC3
+    inc hl
+    ld (hl),#0x80
+    inc hl
+    ld (hl),#0xFD
+    xor a,a
+    ld (#0xFD7E),a           ; counter = 0
+    ld a,(#23388)
+    ld bc,#0x7ffd
+    out (c),a                ; original bank back
+    ei
+    ret
+    __endasm;
+}
+
+// Wraps an esxdos call: bank 6 pinned at 0xC000, I -> the bank-side table, SP
+// -> the bank-side stack. IM2 stays enabled through the whole call. spsave is
+// shared with bankmove: the two never nest.
+void sd_enter (void) __naked
+{
+    __asm
+    di
+    pop hl                   ; return address (the caller's stack is about to go)
+    ld (#_spsave),sp
+    ld a,(#23388)
+    and a,#0xF8
+    or a,#6
+    ld bc,#0x7ffd
+    out (c),a                ; bank 6 in (BANKM itself is NOT updated)
+    ld sp,#0xFD70
+    ld a,#0xFE
+    ld i,a                   ; vectors now come from the bank-side table
+    im 2                     ; (prefill runs before im2_on: force the mode too)
+    ei
+    jp (hl)
+    __endasm;
+}
+
+void sd_exit (void) __naked
+{
+    __asm
+    di
+    pop hl                   ; return address (pushed on the bank-side stack)
+    ld a,(#0xFD7E)           ; interrupts the bank-side ISR counted for us
+    ld d,a
+    xor a,a
+    ld (#0xFD7E),a
+    ld a,(#23388)
+    ld bc,#0x7ffd
+    out (c),a                ; original bank back
+    ld a,#0x31
+    ld i,a                   ; our normal table again
+    ld sp,(#_spsave)
+    ld a,(#_int_cnt)
+    add a,d
+    ld (#_int_cnt),a         ; merge: the clock saw the whole esxdos call
+    ei
+    jp (hl)
     __endasm;
 }
 
@@ -847,7 +946,7 @@ fls_room_ok:
     sbc hl,de
     ld (#_fillb),hl
 fls_noadjust:
-    call _im2_off           ; esxdos must run in the bone-stock interrupt state
+    call _sd_enter          ; esxdos runs with the bank-resident IM2 clock ticking
     ld a,(#_sd_trk)
     ld hl,#_curtrk
     cp a,(hl)
@@ -868,9 +967,9 @@ fls_noseek:
     pop af
     inc sp
     ld (#_xn),hl
-    call _im2_on            ; esxdos is done: remount the clock BEFORE the ring
-                            ; bankmove (it is interrupt-safe), not after — every
-                            ; us of this window loses any /INT that falls in it
+    call _sd_exit           ; esxdos done: merge the interrupts it sat on into
+                            ; int_cnt. The ring bankmove below runs on the normal
+                            ; clock (it is interrupt-safe)
     ld hl,(#_xn)
     ld a,h                  ; if (xn==0xFFFF) xn=0
     and l
@@ -1471,22 +1570,9 @@ lpf_go:
     inc sp
     call _set_curtrk
     inc sp                   ; only 1 net byte was pushed for this single BYTE arg
-    ld a,(#_sd_trk)          ; opening a new burst? split the FAT-walk seek into its
-    ld hl,#_curtrk           ; own frame: seek+read back to back can outlast the
-    cp a,(hl)                ; frame even from an early phase, and the read follows
-    jr z,lpf_fill            ; on the next idle frame with no seek at all
-    call _im2_off
-    call _seeknext           ; to cur.l2end
-    ld hl,(#_cur+4)          ; the file pointer moved with no read to account for
-    ld (#_sdpos),hl          ; it: track it, or the next relative seek would hop
-    ld hl,(#_cur+6)          ; from a stale base
-    ld (#_sdpos+2),hl
-    ld a,(#_curtrk)
-    ld (#_sd_trk),a
-    call _im2_on
-    ret
-lpf_fill:
-    call _l2_fillstep
+    call _l2_fillstep        ; seek (if the burst is opening) and read in one step:
+                             ; the bank-resident clock ticks through both, so a
+                             ; long window only delays this one step, never the song
 lpf_return:
     ret
     __endasm;
@@ -1608,42 +1694,14 @@ st_fpos8done:
     add hl,de
     ld (#_lbytes),hl            ; lbytes += l2_area
 
-    ld a,(#_cur+3)               ; trk_steps[tracks] = (WORD)(len>>7) + 1
-    ld b,a
-    ld a,(#_cur+2)
-    ld c,a
+    ld a,(#_cur+0)               ; trk_steps[tracks] = (WORD)(len>>7) + 1
+    rla                          ; carry = bit 7 of the low byte
     ld a,(#_cur+1)
-    ld d,a
-    ld a,(#_cur+0)
+    rla
     ld e,a
-    srl b
-    rr c
-    rr d
-    rr e
-    srl b
-    rr c
-    rr d
-    rr e
-    srl b
-    rr c
-    rr d
-    rr e
-    srl b
-    rr c
-    rr d
-    rr e
-    srl b
-    rr c
-    rr d
-    rr e
-    srl b
-    rr c
-    rr d
-    rr e
-    srl b
-    rr c
-    rr d
-    rr e                         ; de = len >> 7 (7 single-bit shifts, BCDE)
+    ld a,(#_cur+2)
+    rla
+    ld d,a                       ; de = len >> 7 (tracks are far below 8MB)
     inc de
     ld a,(#_tracks)
     ld l,a
@@ -1714,6 +1772,21 @@ pm1_szloop:
     ld (#_i),a
     jr pm1_szloop
 pm1_szdone:
+    ld a,4(ix)               ; the bank-side IM2 clock lives in the top ~900 bytes
+    ld b,a                   ; of bank 6: when the rings would fill all 64KB
+    ld hl,#0                 ; (track count a power of two), halve the ring size
+    ld de,(#_l2_area)        ; so the allocator never reaches it
+pm1_ovloop:
+    add hl,de
+    jr c,pm1_ovhalve
+    djnz pm1_ovloop
+    jr pm1_ovdone
+pm1_ovhalve:
+    srl d
+    rr e
+    ld (#_l2_area),de
+pm1_ovdone:
+    call _sd_im2_init        ; build the bank-side vector table/ISR/counter
     ld hl,(#_l2_area)
     dec hl
     ld (#_lmask),hl
@@ -1859,17 +1932,11 @@ pm1_mainloop:
     ld l,#0
     jp pm1_epilogue
 pm1_no_space:
-    xor a,a
-    ld (#_hltf),a            ;assume catch-up pass (frame phase unknown)
     ld a,(#_cnt_last)
     ld hl,#_int_cnt
     cp a,(hl)
     jr nz,pm1_skip_halt
     halt
-    ld a,#1                  ;woke ON the interrupt: phase is known from here on
-    ld (#_hltf),a
-    xor a,a
-    ld (#_txlast),a          ;wire bytes sent this frame: none yet
     call _tx_flush           ;just woke ON the frame interrupt: the whole queue goes
                              ;out with the next /INT a full frame away. Any other
                              ;moment in the frame is a guess — a long sweep can end
@@ -2026,13 +2093,6 @@ pm1_sched_done:
     ld a,(#_fired)
     or a,a
     jr nz,pm1_loop_end
-    ld a,(#_hltf)            ;an SD step dismounts the IM2 clock for a few ms, and
-    or a,a                   ;every /INT falling inside is silently lost — so only
-    jr z,pm1_loop_end        ;take one when the frame phase is provably early: the
-    ld a,(#_txlast)          ;pass began with a halt (phase 0) and at most 8 wire
-    cp a,#9                  ;bytes (~3ms) went out since — a slow SD step (~12ms)
-    jr nc,pm1_loop_end       ;still fits the frame. Skipped steps just wait for
-                             ;the next quiet frame.
     call _l2_prefetch
 pm1_loop_end:
     jp pm1_mainloop
