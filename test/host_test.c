@@ -59,6 +59,9 @@ static void bankmove (WORD woff, BYTE *p, WORD n, BYTE wr)
 }
 #define L2STAGE      (buffer+0x3C)
 #define L2STAGE_SIZE 128
+#define SDSTEP       512
+#define SDSTAGE      0xFA80   /* woff of the bank-6 staging; the harness read()
+                                 detects this target and lands in banks64 */
 DWORD sdpos;
 static unsigned long n_seeks_fwd = 0;
 BYTE tpi_frac, tfrac;
@@ -98,6 +101,8 @@ static WORD read (BYTE handle, BYTE *buf, WORD nbytes)
 {
     (void)handle;
     n_reads++;
+    if (buf == (BYTE *)0 + SDSTAGE)   /* the Z80 build reads into the pinned bank */
+        buf = banks64 + SDSTAGE;
     return (WORD)fread (buf, 1, nbytes, F);
 }
 

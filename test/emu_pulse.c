@@ -104,7 +104,11 @@ static void esx (z80 *z, uint8_t call)
         uint16_t addr = hl(z), n = bc(z);
         FILE *f = (z->a < 16) ? fhs[z->a] : NULL;
         if (!f) { z->a = 7; z->cf = 1; break; }
-        size_t r = fread(mem + addr, 1, n, f);
+        uint8_t tmp[65536];
+        size_t r = fread(tmp, 1, n, f);
+        /* write through the memory map: the target may be a paged-in bank */
+        for (size_t k = 0; k < r; k++)
+            *maddr((uint16_t)(addr + k)) = tmp[k];
         if (trace) fprintf(stderr, "[esx] F_READ h=%d addr=%04X n=%u -> %zu\n", z->a, addr, n, r);
         z->b = (r >> 8) & 0xFF; z->c = r & 0xFF;
         z->h = ((addr + r) >> 8) & 0xFF; z->l = (addr + r) & 0xFF;

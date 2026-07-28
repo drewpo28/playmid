@@ -60,16 +60,18 @@ WORD trk_remaining (TRKST *p)
 // Scratch lives in globals: much cheaper than ix-indexed locals on the Z80.
 void l2_fillstep (void)
 {
+    WORD off, chunk;
+
     xn = 0;            // callers poll xn to see whether the step landed
     if (l2_eof[curtrk])
         return;
     remt = trk_remaining (&cur);
-    if (remt > (WORD)(lmask - (L2STAGE_SIZE - 1)))
+    if (remt > (WORD)(lmask - (SDSTEP - 1)))
         return;                                       // no room for a whole step
-    // Write position: the fill pointer only ever advances in steps of 128, so it
-    // stays aligned and a step never straddles the window end. Crossing into the
-    // next window shows up in the bits above lmask; the 16-bit wrap of the last
-    // window (base 0x8000, l2_area 0x8000) folds correctly through the subtract.
+    // Write position: the fill pointer only ever advances in steps of SDSTEP, so
+    // it stays aligned and a step never straddles the window end or a 16KB bank
+    // boundary. Crossing into the next window shows up in the bits above lmask;
+    // the 16-bit wrap of the last window folds correctly through the subtract.
     fillb = cur.bank + remt;
     if ((fillb ^ cur.bank) & ~lmask)
         fillb -= l2_area;
@@ -79,23 +81,34 @@ void l2_fillstep (void)
         seeknext ();   // to cur.l2end: a cheap forward hop from sdpos when possible
         sd_trk = curtrk;
     }
-    xn = read (fhandle, L2STAGE, L2STAGE_SIZE);
+    // One call reads a whole 512-byte step into the bank-6 staging (pinned by
+    // sd_enter anyway): the per-call cost dominates on image-backed media, so
+    // bigger, rarer calls quarter both the tax and the stall count.
+    xn = read (fhandle, (BYTE *)0 + SDSTAGE, SDSTEP);
     sd_exit ();        // esxdos done: merge the interrupts it sat on into int_cnt.
-                       // The ring bankmove below runs on the normal clock (it is
-                       // interrupt-safe)
+                       // The bounce copies below run on the normal clock (they
+                       // are interrupt-safe)
     if (xn == 0xFFFF)
         xn = 0;
     if (xn)
     {
-        bankmove (fillb, L2STAGE, xn, 1);
+        // bounce staging -> target ring through L2STAGE, 128 bytes at a time
+        for (off = 0; off < xn; off += chunk)
+        {
+            chunk = xn - off;
+            if (chunk > 128)
+                chunk = 128;
+            bankmove (SDSTAGE + off, L2STAGE, chunk, 0);
+            bankmove (fillb + off, L2STAGE, chunk, 1);
+        }
         cur.l2end += xn;
         sdpos = cur.l2end;
     }
     // A full step consumes one unit of the track's chunk budget; at zero the whole
-    // chunk sits in the ring (the last step may overshoot its end by <128 bytes:
+    // chunk sits in the ring (the last step may overshoot its end by <512 bytes:
     // harmless, FF 2F stops consumption before them). A short read is the file's
     // EOF. Either way no more SD time is ever spent on this track.
-    if (xn < L2STAGE_SIZE || !--trk_steps[curtrk])
+    if (xn < SDSTEP || !--trk_steps[curtrk])
         l2_eof[curtrk] = 1;
 }
 
@@ -353,7 +366,7 @@ void scan_tracks (BYTE ntrk)
             pst->clen = 0;
             pst++;
             lbytes += l2_area;
-            trk_steps[tracks] = (WORD)(len >> 7) + 1;   // +1: the last (partial) step
+            trk_steps[tracks] = (WORD)(len >> 9) + 1;   // +1: the last (partial) step
             l2_eof[tracks] = 0;
             trk_status[tracks] = 0;
             trk_end[tracks] = 0;

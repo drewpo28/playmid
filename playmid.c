@@ -143,8 +143,16 @@ __at(0x3000) BYTE buffer[1024];  // Staging para la cabecera y los eventos MIDI 
 #define TCACHE_TOTAL 240                  // bytes de buffer disponibles para cachés L1 (la cola
                                           // de la zona de cachés la ocupan txbuf y el horizonte)
 #define tcaches      (buffer+0x202)       // las cachés van tras la tabla de vectores IM2
-#define L2STAGE      (buffer+0x3C)        // staging de recargas L2 (hueco tras la ISR)
-#define L2STAGE_SIZE 128                  // power of 2: keeps the ring fill position aligned
+#define L2STAGE      (buffer+0x3C)        // 128-byte bounce buffer for bank-to-bank copies
+// SD refill step: one F_READ of 512 bytes into the staging area reserved in the
+// top of bank 6 (pinned by sd_enter anyway), then bounced into the target ring
+// through L2STAGE. On media whose cost is per-CALL (MiSTer's image-backed path
+// stalls the whole machine ~5ms per esxdos call, at any size) this quarters the
+// tax versus 128-byte steps. Both sizes are powers of two: every full step
+// keeps the ring fill position 512-aligned, so a step never straddles a ring
+// end or a 16KB bank boundary.
+#define SDSTEP       512
+#define SDSTAGE      0xFA80               // bank-6 staging: woff == CPU address while pinned
 
 // Per-track state, packed in one struct: set_curtrk/scan_tracks walk a single
 // pointer instead of indexing five separate arrays (each indexed DWORD access
@@ -199,7 +207,10 @@ __at (0x30BE) WORD lbytes;       // longitud de metaeventos y sysex
 __at (0x30C0) DWORD ticks_per_int;   // ticks de reloj MIDI por interrupcion, escalado por PRECISION
 __at (0x30C4) DWORD us_per_quarter;  // ultimo tempo leido con el metaevento Set Tempo
 __at (0x30C8) DWORD now;         // ticks transcurridos desde el principio (escalado por PRECISION)
-__at (0x30CC) WORD rem, remt;    // bytes restantes de ventana L2 (solo palabra baja: sobra)
+__at (0x30CC) WORD rem;          // bytes restantes de ventana L2 (solo palabra baja: sobra)
+__at (0x30CE) WORD remt;         // (NB: a single __at on 'WORD rem, remt' aliased BOTH to
+                                 // 0x30CC — a latent bug that bit the moment the two were
+                                 // live at once. Keep every __at to one declarator.)
 __at (0x30D0) DWORD *pnext;      // puntero para recorrer trk_next sin indexar
 __at (0x30D2) BYTE *rdptr;       // ventana de lectura de la pista activa:
 __at (0x30D4) BYTE *rdend;       // evita indexar arrays en cada byte
@@ -665,7 +676,10 @@ void im2_off (void) __naked
 // the paged-out bank, and the kernel inherits our SP). Interrupts stay in IM2
 // through the whole call, ticking the bank-side counter, which is merged into
 // int_cnt on exit: the clock no longer misses SD time at all, on any card.
-// Layout in bank 6 (CPU addresses while paged at 0xC000):
+// Layout in bank 6 (CPU addresses while paged at 0xC000; the ring allocator
+// halves l2_area when the rings would fill all 64KB, so allocation always ends
+// at or below SDSTAGE):
+//   0xFA80-0xFC7F  SD read staging: one F_READ lands a whole SDSTEP here
 //   0xFC80-0xFD6F  stack for the esxdos call (top at 0xFD70)
 //   0xFD7E         interrupt counter (merged into int_cnt by sd_exit)
 //   0xFD80-0xFD8B  ISR: inc the counter, ei, reti
@@ -804,14 +818,12 @@ st_fpos8done:
     add hl,de
     ld (#_lbytes),hl            ; lbytes += l2_area
 
-    ld a,(#_cur+0)               ; trk_steps[tracks] = (WORD)(len>>7) + 1
-    rla                          ; carry = bit 7 of the low byte
+    ld a,(#_cur+2)               ; trk_steps[tracks] = (WORD)(len>>9) + 1
+    srl a
+    ld d,a
     ld a,(#_cur+1)
-    rla
-    ld e,a
-    ld a,(#_cur+2)
-    rla
-    ld d,a                       ; de = len >> 7 (tracks are far below 8MB)
+    rra
+    ld e,a                       ; de = len >> 9 (tracks are far below 8MB)
     inc de
     ld a,(#_tracks)
     ld l,a
@@ -1168,9 +1180,11 @@ WORD trk_remaining (TRKST *p) STACKARGS
     __endasm;
 }
 
-// One refill step of the active track's L2 ring: reads at most L2STAGE_SIZE bytes
-// from the SD and appends them to the ring. Bounded to a few ms, so the SD cost is
-// spread across many frames instead of stalling the music with whole-window reloads
+// One refill step of the active track's L2 ring: one F_READ of up to SDSTEP
+// bytes into the bank-6 staging (bank 6 is pinned by sd_enter anyway), bounced
+// into the target ring through L2STAGE afterwards, with interrupts enabled.
+// Bounded, so the SD cost is spread across frames instead of stalling the music
+// with whole-window reloads
 // (frames that esxdos spends with our IM2 clock dismounted are lost, and a whole
 // window is several frames in a row: it was heard as a glitch). The seek (a
 // FAT-chain walk, the expensive part) is skipped when the last SD read was for this
@@ -1199,9 +1213,9 @@ void l2_fillstep (void) __naked
     ld (#_remt),hl
 
     ld hl,(#_lmask)
-    ld de,#-127             ; -(L2STAGE_SIZE-1)
+    ld de,#-511             ; -(SDSTEP-1)
     add hl,de
-    ex de,hl                ; de = lmask-127 (threshold)
+    ex de,hl                ; de = lmask-511 (threshold)
     ld hl,(#_remt)
     or a
     sbc hl,de               ; hl = remt - threshold
@@ -1249,9 +1263,9 @@ fls_noadjust:
     ld a,(#_curtrk)
     ld (#_sd_trk),a
 fls_noseek:
-    ld hl,#0x0080           ; xn = read(fhandle, L2STAGE, L2STAGE_SIZE)
-    push hl
-    ld hl,#(_buffer+60)
+    ld hl,#0x0200           ; xn = read(fhandle, SDSTAGE, SDSTEP): one call reads
+    push hl                 ; a whole 512-byte step into the bank-6 staging (the
+    ld hl,#0xFA80           ; per-call cost dominates on image-backed media)
     push hl
     ld a,(#_fhandle)
     push af
@@ -1276,21 +1290,63 @@ fls_xnok:
     ld hl,(#_xn)
     ld a,h
     or l
-    jr z,fls_noxn
-    ld a,#1                 ; bankmove(fillb, L2STAGE, xn, 1)
+    jp z,fls_noxn
+    ld hl,#0                ; bounce staging -> target ring, 128 bytes at a time
+    ld (#_rem),hl           ; off = 0 (rem/remt: free scratch by now)
+fls_bounce:
+    ld hl,(#_xn)
+    ld de,(#_rem)
+    or a
+    sbc hl,de               ; hl = xn - off
+    jp z,fls_moved
+    ld de,#128
+    or a
+    sbc hl,de
+    jr nc,fls_chunk128
+    add hl,de               ; chunk = xn - off (< 128, the short eof read)
+    jr fls_chunkset
+fls_chunk128:
+    ld hl,#128
+fls_chunkset:
+    ld (#_remt),hl
+    xor a,a                 ; bankmove(SDSTAGE+off, L2STAGE, chunk, 0)
     push af
     inc sp
-    ld hl,(#_xn)
+    ld hl,(#_remt)
     push hl
     ld hl,#(_buffer+60)
     push hl
-    ld hl,(#_fillb)
+    ld hl,(#_rem)
+    ld de,#0xFA80
+    add hl,de
     push hl
     call _bankmove
     pop af
     pop af
     pop af
     inc sp
+    ld a,#1                 ; bankmove(fillb+off, L2STAGE, chunk, 1)
+    push af
+    inc sp
+    ld hl,(#_remt)
+    push hl
+    ld hl,#(_buffer+60)
+    push hl
+    ld hl,(#_rem)
+    ld de,(#_fillb)
+    add hl,de
+    push hl
+    call _bankmove
+    pop af
+    pop af
+    pop af
+    inc sp
+    ld hl,(#_rem)           ; off += chunk
+    ld de,(#_remt)
+    add hl,de
+    ld (#_rem),hl
+    jr fls_bounce
+fls_moved:
     ld hl,(#_cur+4)         ; cur.l2end += xn (32-bit: propagate the carry)
     ld de,(#_xn)
     add hl,de
@@ -1306,8 +1362,8 @@ fls_l2end_done:
     ld (#_sdpos+2),hl
 fls_noxn:
     ld hl,(#_xn)            ; a full step consumes one unit of the tracks chunk
-    ld de,#128              ; budget; at zero the whole chunk sits in the ring (the
-    or a                    ; last step may overshoot its end by <128 bytes: harmless,
+    ld de,#512              ; budget; at zero the whole chunk sits in the ring (the
+    or a                    ; last step may overshoot its end by <512 bytes: harmless,
     sbc hl,de               ; FF 2F stops consumption before them). A short read is
     jr c,fls_seteof         ; the eof. Either way no more SD time is spent here.
     ld a,(#_curtrk)
