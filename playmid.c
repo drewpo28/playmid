@@ -2427,7 +2427,7 @@ void playmidi (BYTE f)
     // at a glance. NOTE: never print via RST 16 on the success path: under launchers
     // like the LNF Browser the BASIC screen channel is invalid and printing resets
     // the machine.
-    ULA = buffer[9] ? 6 : 4;
+    ULA = 7; // buffer[9] ? 6 : 4;
 
     res = playmidi1 (buffer[10] ? MAX_TRACKS : buffer[11]);   // numero de pistas de la cabecera (topado a MAX_TRACKS)
     im2_off ();     // restauramos IM1 e I=0x3F antes de volver al sistema

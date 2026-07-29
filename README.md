@@ -41,12 +41,29 @@ Press SPACE to stop playback. The border is green while a format 0 file plays an
 Requires SDCC 4.x with the Z80 backend (`makebin` ships with it):
 
 ```sh
+# path to the bundled z80.lib; on Debian/Ubuntu (sdcc-libraries) it is
+# /usr/share/sdcc/lib/z80, elsewhere: find "$(dirname "$(which sdcc)")/.." -name z80.lib
+SDCC_Z80_LIB=/usr/share/sdcc/lib/z80
+
 sdcc -mz80 --reserve-regs-iy --opt-code-size --max-allocs-per-node 100000 \
   --nostdlib --nostdinc --no-std-crt0 --code-loc 0x2000 --data-loc 0x2eba \
-  playmid.c z80.lib -L /path/to/sdcc/lib/z80
+  playmid.c "$SDCC_Z80_LIB/z80.lib" -L "$SDCC_Z80_LIB"
 makebin -s 65535 -p playmid.ihx playmid.bin
 dd if=playmid.bin of=PLAYMID bs=1 skip=8192
 ```
+
+Pass `z80.lib` by its **full path**, and check the link actually found it — the
+linker only warns and keeps going:
+
+```sh
+grep -i undefined playmid.map    # must print nothing
+grep l__HOME playmid.map         # must be non-zero (~0x7A), not 00000000
+```
+
+With the library missing, `__mulint` (header `ppq`) and `__divulong` (`settempo`)
+link as `call 0x0000`, `_HOME` stays empty and 0x2F86-0x2FFF is left as `0xFF`
+filler — the dot command then resets the machine the moment a file is loaded,
+having compiled and linked without an error.
 
 Do **not** pass `--sdcccall 0` on SDCC 4.2+: the bundled `z80.lib` is built with the default register calling convention, and the 32-bit multiply/divide helpers silently return garbage if the compiler passes their arguments on the stack. The functions containing inline assembly are individually marked `__sdcccall(0)` in the source instead. After any change, check in the `.map` file that `_CODE` ends below `--data-loc` and `_HOME` ends below 0x3000, adjusting `--data-loc` if needed (the whole dot command must fit in 0x2000-0x2FFF plus the buffer at 0x3000 — it is packed to within a handful of bytes, which is also why several scalar globals live at absolute addresses inside the buffer page).
 
