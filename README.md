@@ -24,7 +24,7 @@ Four further clock details keep the tempo honest:
 
 **Memory discipline.** Everything lives inside the player's 4KB code/data budget plus the 1KB buffer at 0x3000 (output staging, IM2 handler and its 257-byte vector table, L2 read staging, per-track L1 caches). The player deliberately touches nothing else: not the DivMMC page above 0x33FF and not the screen — command launchers such as the LNF Browser keep live state in both, and writing there hangs or resets the machine on return. Nothing is ever printed on the success path (under such launchers the BASIC screen channel is invalid and printing via RST 16 resets the machine); instead the border shows the state: green while a format 0 file plays, yellow for format 1, blue on a bad file, restored on exit. Interrupts are explicitly enabled at startup since some launchers pass control with them disabled.
 
-**On exit** the player sends All Sound Off + All Notes Off on all 16 channels, so no notes are left hanging.
+**On exit** the player sends All Sound Off + All Notes Off on all 16 channels, so no notes are left hanging, followed by a GM System On reset. Files routinely reprogram the synth and never undo it — karaoke MIDIs in particular like to set the pitch-bend range to 12 semitones via RPN 0, and a stop mid-song can leave the sustain pedal down; none of that is cleared by All Notes Off, and the next file played would inherit it (its bends sweeping 6× wider than written sounds like garbage). The GM reset returns controllers, programs and volumes to the GM power-on state.
 
 ## Usage
 

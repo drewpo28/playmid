@@ -400,6 +400,18 @@ BYTE main (char *p) STACKARGS
       buffer[0] = 0xB0 | i;
       SendMIDI (buffer, 5);
   }
+
+  // ...y un GM System On. Muchos MIDIs cambian el estado del sintetizador y no lo
+  // devuelven: rango de pitch bend via RPN 0 (los karaoke suelen poner 12 semitonos),
+  // pedal de sustain pisado, NRPNs, programas. Todo eso sobrevive a la salida, y el
+  // siguiente MIDI que confie en los valores GM por defecto suena desafinado (sus
+  // bends abarcan 6 veces mas) o empastado. All Notes Off NO resetea nada de esto;
+  // el GM Reset devuelve controladores, programas y volumenes al estado GM inicial.
+  ((WORD *)buffer)[0] = 0x7EF0;   // F0 7E: SysEx, Universal Non-Realtime
+  ((WORD *)buffer)[1] = 0x097F;   // 7F 09: device all, General MIDI
+  ((WORD *)buffer)[2] = 0xF701;   // 01 F7: GM System On, EOX
+  SendMIDI (buffer, 6);
+
   tx_flush ();      // SendMIDI only queues: drain whatever is still waiting
 
   return res;
@@ -408,7 +420,7 @@ BYTE main (char *p) STACKARGS
 // Abre el fichero. Si no existe, retorna con error. Si existe, pasa su handle a la rutina principal.
 BYTE commandlinemode (char *p)
 {
-    char fname[32];
+    char fname[64];
     BYTE handle;
 
     getfilename (p, fname);
@@ -2555,9 +2567,14 @@ __endasm;
 
 // Copia desde una posición de memoria, los bytes que forman el nombre de un fichero hasta encontrar un espacio,
 // un retorno de linea, o el simbolo de los dos puntos ":" para indicar fin de una sentencia. Se usa en ESXDOS
+// Copia el nombre de fichero de la linea de comandos. Termina en ':' (separador de
+// sentencias BASIC), CR o NUL — pero NO en espacio: los nombres largos pueden llevarlos
+// ("Mel`nitca (Karaoke).mid"). La copia esta acotada: fname es un buffer de 64 bytes
+// en la pila y una linea de comandos larga lo desbordaba y machacaba la pila.
 void getfilename (char *p, char *fname)
 {
-    while (*p!=':' && *p!=0xd && *p!=' ')
+    BYTE n = 63;
+    while (*p!=':' && *p!=0xd && *p!=0 && n--)
           *fname++ = *p++;
     *fname = '\0';
     return;
